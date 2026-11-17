@@ -46,7 +46,9 @@ ln -s "$PWD/kanban" ~/.local/bin/kanban   # optional: put it on PATH
 
 Requires Python 3.8+. Board location: `--db PATH`, else `$KANBAN_DB`, else
 `./.kanban/kanban.db`. Actor name: `--actor NAME`, else `$KANBAN_ACTOR`, else
-`$USER`. Every command also accepts `--json`.
+`$USER`. Every command also accepts `--json`. Remote mode: set `$KANBAN_URL`
+(or pass `--url`) and every command runs against the leader over HTTP — see
+"Across multiple PCs".
 
 ## Watch it live
 
@@ -78,7 +80,7 @@ todo ──(all parents done)──> ready ──(claim)──> doing ──> do
                                             └───────> blocked ──(unblock)──> ready
 ```
 
-## Multi-agent usage
+## Multi-agent usage (one PC)
 
 Point every agent at the same board and give each a distinct actor name:
 
@@ -103,6 +105,41 @@ Parallel `add`/`claim`/`complete` calls from many processes never lose events.
 Claims expire (default TTL 900 s, `--ttl` to change); `kanban reclaim` releases
 stale ones back to `ready`.
 
+## Across multiple PCs — leader-follower mode
+
+SQLite is single-host (WAL locking doesn't survive network filesystems), so the
+board file lives on **one leader PC**; every other PC is a thin follower that
+talks HTTP. All commands work unchanged — set one env var on the followers:
+
+```bash
+# PC1 — the leader (owns the database)
+kanban serve --host 0.0.0.0 --port 8765        # bind 127.0.0.1 for localhost-only
+
+# PC2, PC3, ... — followers
+export KANBAN_URL=http://pc1:8765
+kanban add "task from pc2" --assignee qa
+kanban claim --any --assignee qa --actor qa
+kanban dash                                     # live board, long-polled from the leader
+kanban watch --json                             # NDJSON feed, long-polled from the leader
+```
+
+```
+PC2 (follower)              PC1 (leader)
+kanban claim --any ──HTTP──> kanban serve ──> SQLite (WAL, atomic claims)
+kanban dash        <──GET /snapshot / /events?since=N (long-poll)──
+```
+
+- The leader runs the exact same command functions in-process, so claims stay
+  **atomic across all PCs** — two followers can never grab the same card.
+- `watch`/`dash` on followers long-poll `GET /events?since=N` / `GET /snapshot`,
+  so the live feed works over the network with ~LAN-latency updates.
+- `--url http://pc1:8765` works per-command as an alternative to `$KANBAN_URL`.
+- The HTTP API is unauthenticated (stdlib `http.server`) — use it on trusted
+  LANs/VPNs only; put it behind a reverse proxy with auth if you expose it.
+- HTTP endpoints: `POST /cmd/<command>` (any CLI command, JSON args),
+  `GET /events?since=N&timeout=25` (long-poll feed), `GET /events?max=1` (latest),
+  `GET /snapshot?feed=N`, `GET /health`.
+
 ## Commands
 
 | Command | What it does |
@@ -126,6 +163,7 @@ stale ones back to `ready`.
 | `kanban rm <id>` | archive |
 | `kanban events [--task ID] [--limit N]` | dump the change feed |
 | `kanban watch [--json] [--since N] [--interval S]` | stream the change feed live (Ctrl-C to stop) |
+| `kanban serve [--host H] [--port P]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL` |
 
 ## The kanban-cli skill
 

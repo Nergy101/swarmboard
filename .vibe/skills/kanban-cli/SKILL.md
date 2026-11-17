@@ -130,6 +130,27 @@ Tell them what you created in plain prose, naming the actual agents:
 >
 > T1 and T2 are `ready` now. T3 starts when both finish. Follow along with `kanban watch` or `kanban show <id>`.
 
+## Multiple machines — leader-follower mode
+
+The board file is single-host SQLite, so across PCs one machine is the
+**leader** and the rest are followers:
+
+```bash
+# leader PC — owns the database, serves the API
+kanban serve --host 0.0.0.0 --port 8765
+
+# every other PC / agent
+export KANBAN_URL=http://leader:8765
+kanban add "task" --assignee researcher      # identical commands, run remotely
+kanban claim --any --assignee researcher
+kanban dash                                   # live board long-polled from the leader
+```
+
+Claims stay atomic across all machines because only the leader touches the
+database. `watch`/`dash` long-poll the leader's event feed. The API is
+unauthenticated — trusted LAN/VPN only. Same board on one PC? Just share
+`$KANBAN_DB` and skip `serve` entirely.
+
 ## Following the work live
 
 ```bash
