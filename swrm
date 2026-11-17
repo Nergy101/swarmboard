@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""kanban — CLI-first kanban board for multiple agents working at once.
+"""swrm — the swarmboard CLI: a CLI-first kanban board for multiple agents
+working at once, with a live change feed.
 
 Single-file, stdlib-only. State lives in one SQLite database (WAL mode), so
 any number of agents/processes can read and write concurrently. Every mutation
-is appended to an `events` table in the same transaction; `kanban watch`
+is appended to an `events` table in the same transaction; `swrm watch`
 streams that feed live.
 
 Board location: --db PATH, else $KANBAN_DB, else ./.kanban/kanban.db
 Actor identity: --actor NAME, else $KANBAN_ACTOR, else $USER, else "unknown"
+Remote mode: --url URL or $KANBAN_URL (leader-follower via `swrm serve`)
 """
 
 import argparse
@@ -156,7 +158,7 @@ def touch(con, task_id):
 
 
 def die(msg, code=1):
-    print(f"kanban: error: {msg}", file=sys.stderr)
+    print(f"swrm: error: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -777,7 +779,7 @@ def cmd_dash(args):
 
 # ---------------------------------------------------------------- leader-follower (HTTP)
 #
-# Leader:  kanban serve --host 0.0.0.0 --port 8765     (owns the SQLite db)
+# Leader:  swrm serve --host 0.0.0.0 --port 8765     (owns the SQLite db)
 # Follower: export KANBAN_URL=http://leader:8765       (CLI talks HTTP instead of SQLite)
 #
 # The server runs the exact same command functions in-process, so all atomicity
@@ -1010,7 +1012,7 @@ def build_parser():
     common.add_argument("--url", help="leader URL (default: $KANBAN_URL); when set, commands run remotely over HTTP")
 
     p = argparse.ArgumentParser(
-        prog="kanban",
+        prog="swrm",
         description="CLI-first kanban board for multiple agents, with a live change feed.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)

@@ -6,16 +6,17 @@
 
 <p align="center">
   <b>One board. The whole swarm.</b><br/>
-  A CLI-first kanban board that any number of agents can work on <b>at the same time</b> —
+  A CLI-first kanban board (`swrm`) that any number of agents can work on <b>at the same time</b> —
   with a live terminal view and an immediate change feed. No server, no dependencies.
 </p>
 
 <p align="center">
   <a href="#install">Install</a> ·
   <a href="#watch-it-live">Live board</a> ·
-  <a href="#multi-agent-usage">Multi-agent</a> ·
+  <a href="#multi-agent-usage-one-pc">Multi-agent</a> ·
+  <a href="#across-multiple-pcs--leader-follower-mode">Multi-PC</a> ·
   <a href="#commands">Commands</a> ·
-  <a href="#the-kanban-cli-skill">Skill</a>
+  <a href="#the-swarmboard-skill">Skill</a>
 </p>
 
 ---
@@ -29,19 +30,19 @@ concurrently — and everyone sees it happen immediately.
 - **Concurrency-safe by design** — one SQLite database in WAL mode; claims are
   atomic, so two agents can never grab the same card.
 - **Immediate change feed** — every mutation lands in an append-only event log
-  in the same transaction. `kanban watch` streams it; `kanban dash` renders it.
-- **Terminal-first** — the board *is* the terminal. Open `kanban dash` and watch
+  in the same transaction. `swrm watch` streams it; `swrm dash` renders it.
+- **Terminal-first** — the board *is* the terminal. Open `swrm dash` and watch
   the swarm move.
-- **Zero dependencies** — a single Python 3 file using only the standard library.
+- **Zero dependencies** — a single Python 3 file (`swrm`) using only the standard library.
 
 ## Install
 
 ```bash
 git clone https://github.com/Nergy101/swarmboard.git
 cd swarmboard
-chmod +x kanban                 # already executable
-ln -s "$PWD/kanban" ~/.local/bin/kanban   # optional: put it on PATH
-./kanban init                   # create ./.kanban/kanban.db
+chmod +x swrm                   # already executable
+ln -s "$PWD/swrm" ~/.local/bin/swrm   # optional: put it on PATH
+swrm init                       # create ./.kanban/kanban.db
 ```
 
 Requires Python 3.8+. Board location: `--db PATH`, else `$KANBAN_DB`, else
@@ -55,7 +56,7 @@ Requires Python 3.8+. Board location: `--db PATH`, else `$KANBAN_DB`, else
 Open a terminal and run:
 
 ```bash
-kanban dash        # full-screen live board, re-rendered every 0.5s
+swrm dash          # full-screen live board, re-rendered every 0.5s (alias: swrm dashboard)
 ```
 
 ```
@@ -69,8 +70,8 @@ t_aa11 P1 @dev  t_bb22 P3 @qa   t_9f4b P0 [dev 14m59s] polish dashboard
 ```
 
 `doing` rows show **which worker picked up which task** and the time left on
-their claim. Ctrl-C to stop. `kanban dash --once` prints one snapshot (default
-when piped); `kanban watch --json` is the NDJSON feed for piping into other
+their claim. Ctrl-C to stop. `swrm dash --once` prints one snapshot (default
+when piped); `swrm watch --json` is the NDJSON feed for piping into other
 agents.
 
 ## Lifecycle
@@ -88,21 +89,21 @@ Point every agent at the same board and give each a distinct actor name:
 export KANBAN_DB=/shared/project/.kanban/kanban.db
 
 # orchestrator fans work out — children wait for their parents automatically
-T1=$(kanban add "research costs" --assignee researcher --json | jq -r .id)
-T2=$(kanban add "research perf"  --assignee researcher --json | jq -r .id)
-kanban add "synthesize" --assignee analyst --parent "$T1" --parent "$T2"
+T1=$(swrm add "research costs" --assignee researcher --json | jq -r .id)
+T2=$(swrm add "research perf"  --assignee researcher --json | jq -r .id)
+swrm add "synthesize" --assignee analyst --parent "$T1" --parent "$T2"
 
 # workers self-serve from the board
-kanban claim --any --assignee researcher --actor researcher   # atomic claim
-kanban comment "$T1" "started" --actor researcher
-kanban complete "$T1" --actor researcher --summary "costs done"
+swrm claim --any --assignee researcher --actor researcher   # atomic claim
+swrm comment "$T1" "started" --actor researcher
+swrm complete "$T1" --actor researcher --summary "costs done"
 
 # anyone can watch the swarm live
-kanban dash
+swrm dash
 ```
 
 Parallel `add`/`claim`/`complete` calls from many processes never lose events.
-Claims expire (default TTL 900 s, `--ttl` to change); `kanban reclaim` releases
+Claims expire (default TTL 900 s, `--ttl` to change); `swrm reclaim` releases
 stale ones back to `ready`.
 
 ## Across multiple PCs — leader-follower mode
@@ -113,20 +114,20 @@ talks HTTP. All commands work unchanged — set one env var on the followers:
 
 ```bash
 # PC1 — the leader (owns the database)
-kanban serve --host 0.0.0.0 --port 8765        # bind 127.0.0.1 for localhost-only
+swrm serve --host 0.0.0.0 --port 8765        # bind 127.0.0.1 for localhost-only
 
 # PC2, PC3, ... — followers
 export KANBAN_URL=http://pc1:8765
-kanban add "task from pc2" --assignee qa
-kanban claim --any --assignee qa --actor qa
-kanban dash                                     # live board, long-polled from the leader
-kanban watch --json                             # NDJSON feed, long-polled from the leader
+swrm add "task from pc2" --assignee qa
+swrm claim --any --assignee qa --actor qa
+swrm dash                                     # live board, long-polled from the leader
+swrm watch --json                             # NDJSON feed, long-polled from the leader
 ```
 
 ```
 PC2 (follower)              PC1 (leader)
-kanban claim --any ──HTTP──> kanban serve ──> SQLite (WAL, atomic claims)
-kanban dash        <──GET /snapshot / /events?since=N (long-poll)──
+swrm claim --any ──HTTP──>  swrm serve ──> SQLite (WAL, atomic claims)
+swrm dash       <──GET /snapshot / /events?since=N (long-poll)──
 ```
 
 - The leader runs the exact same command functions in-process, so claims stay
@@ -144,35 +145,36 @@ kanban dash        <──GET /snapshot / /events?since=N (long-poll)──
 
 | Command | What it does |
 |---|---|
-| `kanban init` | create the board database |
-| `kanban add "title" [--body B] [--assignee A] [--priority N] [--label L]... [--parent ID]...` | create a card; starts `ready`, or `todo` if any parent isn't `done` |
-| `kanban ls [--status S] [--assignee A] [--label L]` | list cards |
-| `kanban board` | static column view |
-| `kanban dash` (aliases `dashboard`, `live`) | **live-updating board view** — `--once`, `--follow`, `--interval`, `--feed N` |
-| `kanban show <id>` | card detail + parents/children + full event history |
-| `kanban claim <id>` / `kanban claim --any [--assignee A] [--ttl SECONDS]` | atomically claim a `ready` card |
-| `kanban release <id> [--force]` | release a claim back to `ready` |
-| `kanban reclaim [id] [--force]` | release expired claims back to `ready` |
-| `kanban complete <id> --summary "..."` | mark `done`; auto-promotes children whose parents are all done |
-| `kanban block <id> --reason "..."` / `kanban unblock <id>` | park / revive a card |
-| `kanban move <id> <status>` | set status directly (`todo ready doing done blocked archived`) |
-| `kanban assign <id> <agent>` | reassign |
-| `kanban edit <id> [--title T] [--body B] [--priority N] [--label L]...` | edit fields |
-| `kanban link <parent> <child>` / `kanban unlink <parent> <child>` | dependency links; linking demotes a runnable child to `todo` until parents finish |
-| `kanban comment <id> "text"` | add a note to the card's history |
-| `kanban rm <id>` | archive |
-| `kanban events [--task ID] [--limit N]` | dump the change feed |
-| `kanban watch [--json] [--since N] [--interval S]` | stream the change feed live (Ctrl-C to stop) |
-| `kanban serve [--host H] [--port P]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL` |
+| `swrm init` | create the board database |
+| `swrm add "title" [--body B] [--assignee A] [--priority N] [--label L]... [--parent ID]...` | create a card; starts `ready`, or `todo` if any parent isn't `done` |
+| `swrm ls [--status S] [--assignee A] [--label L]` | list cards |
+| `swrm board` | static column view |
+| `swrm dash` (aliases `dashboard`, `live`) | **live-updating board view** — `--once`, `--follow`, `--interval`, `--feed N` |
+| `swrm show <id>` | card detail + parents/children + full event history |
+| `swrm claim <id>` / `swrm claim --any [--assignee A] [--ttl SECONDS]` | atomically claim a `ready` card |
+| `swrm release <id> [--force]` | release a claim back to `ready` |
+| `swrm reclaim [id] [--force]` | release expired claims back to `ready` |
+| `swrm complete <id> --summary "..."` | mark `done`; auto-promotes children whose parents are all done |
+| `swrm block <id> --reason "..."` / `swrm unblock <id>` | park / revive a card |
+| `swrm move <id> <status>` | set status directly (`todo ready doing done blocked archived`) |
+| `swrm assign <id> <agent>` | reassign |
+| `swrm edit <id> [--title T] [--body B] [--priority N] [--label L]...` | edit fields |
+| `swrm link <parent> <child>` / `swrm unlink <parent> <child>` | dependency links; linking demotes a runnable child to `todo` until parents finish |
+| `swrm comment <id> "text"` | add a note to the card's history |
+| `swrm rm <id>` | archive |
+| `swrm events [--task ID] [--limit N]` | dump the change feed |
+| `swrm watch [--json] [--since N] [--interval S]` | stream the change feed live (Ctrl-C to stop) |
+| `swrm serve [--host H] [--port P]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL` |
 
-## The kanban-cli skill
+## The swarmboard skill
 
-`.vibe/skills/kanban-cli/SKILL.md` is the orchestrator playbook for routing a
-swarm through this board (adapted from the `kanban-orchestrator` workflow):
-decomposition patterns, parent-gating, anti-temptation rules ("route, don't
-execute"), and stuck-card recovery — all expressed in these CLI commands.
+`.vibe/skills/swarmboard/SKILL.md` is the orchestrator playbook for routing a
+swarm through this board (load it as `/swarmboard`; adapted from the
+`kanban-orchestrator` workflow): decomposition patterns, parent-gating,
+anti-temptation rules ("route, don't execute"), and stuck-card recovery — all
+expressed in `swrm` commands.
 
 ## Development
 
-Single file: `kanban` (Python 3 stdlib only). Schema: `tasks`, `links`
+Single file: `swrm` (Python 3 stdlib only). Schema: `tasks`, `links`
 (parent→child), `events` (append-only audit feed). Logo: `assets/logo.svg`.

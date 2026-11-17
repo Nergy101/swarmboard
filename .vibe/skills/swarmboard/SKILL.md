@@ -1,32 +1,34 @@
 ---
-name: kanban-cli
-description: Load this skill when routing multi-agent work through the `kanban` CLI board (the single-file SQLite kanban tool in this repo). Decomposition playbook + anti-temptation rules for an orchestrator agent: create cards with `kanban add`, gate them with `kanban link`/`--parent`, let workers self-claim with `kanban claim --any`, and follow the live change feed with `kanban watch`.
+name: swarmboard
+description: Load this skill when working with swarmboard — the `swrm` CLI, a terminal-first kanban board for multiple agents working at once with a live change feed. Triggers on: swarmboard, swrm, kanban board cli, cli kanban, multi-agent kanban, agent task board. Use it to route work through the board: `swrm add` cards, `swrm link`/`--parent` dependencies, `swrm claim --any` for workers, `swrm dash`/`swrm watch` for the live feed, `swrm serve` + `$KANBAN_URL` for multi-PC leader-follower mode.
 ---
 
-# kanban-cli — Orchestrator Playbook for the `kanban` CLI
+# swarmboard — Orchestrator Playbook for the `swrm` CLI
 
-This is the adapted playbook for the `kanban` command in this repo: a
+This is the playbook for **swarmboard**, the `swrm` command in this repo: a
 CLI-first, SQLite-backed kanban board that any number of agents can use at
-the same time, with a live change feed (`kanban watch`). It replaces the
-Hermes `kanban_*` tool calls with shell commands.
+the same time, with a live change feed (`swrm watch`) and a live terminal
+board (`swrm dash`). It replaces the Hermes `kanban_*` tool calls with shell
+commands.
 
 > The board is one SQLite database (WAL mode), so concurrent agents are
 > safe: claims are atomic and every mutation lands in the `events` feed in
 > the same transaction. Point every agent at the same board with `--db
-> PATH` or `$KANBAN_DB` (default `./.kanban/kanban.db`).
+> PATH` or `$KANBAN_DB` (default `./.kanban/kanban.db`). Across multiple
+> PCs, run `swrm serve` on one leader and set `$KANBAN_URL` on the rest.
 
 ## The lifecycle
 
 ```
-todo ──(all parents done)──> ready ──(kanban claim)──> doing ──> done
-                                                              └────> blocked ──(kanban unblock)──> ready
+todo ──(all parents done)──> ready ──(swrm claim)──> doing ──> done
+                                                              └────> blocked ──(swrm unblock)──> ready
 ```
 
-- `kanban add "title"` creates a card in `ready` (or `todo` if it has unfinished parents).
-- `kanban claim <id>` / `kanban claim --any --assignee <you>` atomically moves a card to `doing`. Two agents can never claim the same card.
-- `kanban complete <id> --summary "..."` marks `done` and auto-promotes children whose parents are all done.
-- `kanban block <id> --reason "..."` parks a card for human input; `kanban unblock <id>` returns it to `ready`.
-- Claims expire (default TTL 900s, `--ttl` to change). `kanban reclaim` releases expired claims back to `ready`.
+- `swrm add "title"` creates a card in `ready` (or `todo` if it has unfinished parents).
+- `swrm claim <id>` / `swrm claim --any --assignee <you>` atomically moves a card to `doing`. Two agents can never claim the same card.
+- `swrm complete <id> --summary "..."` marks `done` and auto-promotes children whose parents are all done.
+- `swrm block <id> --reason "..."` parks a card for human input; `swrm unblock <id>` returns it to `ready`.
+- Claims expire (default TTL 900s, `--ttl` to change). `swrm reclaim` releases expired claims back to `ready`.
 
 Every command accepts `--json` (machine-readable output) and `--actor NAME`
 (or `$KANBAN_ACTOR`) so the feed shows who did what.
@@ -37,7 +39,7 @@ Assignees are free-form names — there is no fixed roster, and nothing
 validates them, so a card assigned to a name nobody uses just sits in
 `ready` forever. Ground your plan in the agents that actually exist:
 
-- `kanban ls --assignee <name>` — sanity-check a single name (empty list = nobody has used it yet).
+- `swrm ls --assignee <name>` — sanity-check a single name (empty list = nobody has used it yet).
 - Ask the user: "Which agents are working on this?" is a fine first turn.
 
 Cache the answer; don't re-ask every turn.
@@ -51,7 +53,7 @@ Create cards when any of these are true:
 3. **The user might want to interject.** Human-in-the-loop at any step.
 4. **Subtasks can run in parallel.** Fan-out for speed.
 5. **Review / iteration is expected.** A reviewer loops on a drafter's output.
-6. **The audit trail matters.** Every mutation is an event in the feed (`kanban events`, `kanban watch`).
+6. **The audit trail matters.** Every mutation is an event in the feed (`swrm events`, `swrm watch`).
 
 If none apply — a small one-shot task — just do it or answer directly.
 
@@ -90,13 +92,13 @@ Show the graph to the user before creating cards. Let them correct it, including
 Create parents first, capture their ids, then pass them to children with `--parent` (repeatable):
 
 ```bash
-T1=$(kanban add "research: Postgres cost vs current" --assignee researcher --json | jq -r .id)
-T2=$(kanban add "research: Postgres performance vs current" --assignee researcher --json | jq -r .id)
-T3=$(kanban add "synthesize migration recommendation" --assignee analyst \
+T1=$(swrm add "research: Postgres cost vs current" --assignee researcher --json | jq -r .id)
+T2=$(swrm add "research: Postgres performance vs current" --assignee researcher --json | jq -r .id)
+T3=$(swrm add "synthesize migration recommendation" --assignee analyst \
      --parent "$T1" --parent "$T2" \
      --body "Read the findings from $T1 (cost) and $T2 (performance). Produce a 1-page recommendation with explicit trade-offs and a go/no-go call." \
      --json | jq -r .id)
-T4=$(kanban add "draft decision memo" --assignee writer \
+T4=$(swrm add "draft decision memo" --assignee writer \
      --parent "$T3" \
      --body "Turn the analyst's recommendation into a 2-page memo for the CTO." \
      --json | jq -r .id)
@@ -104,18 +106,18 @@ T4=$(kanban add "draft decision memo" --assignee writer \
 
 `--parent` gates promotion — children stay in `todo` until every parent is `done`, then auto-promote to `ready`. No manual coordination needed.
 
-Avoid creating all cards in parallel and linking them afterward with `kanban link` — that leaves a window where a worker can claim a child before its inputs exist. (`kanban link <parent> <child>` still exists for fixing graphs after the fact; note it demotes a runnable child back to `todo` if the new parent isn't done.)
+Avoid creating all cards in parallel and linking them afterward with `swrm link` — that leaves a window where a worker can claim a child before its inputs exist. (`swrm link <parent> <child>` still exists for fixing graphs after the fact; note it demotes a runnable child back to `todo` if the new parent isn't done.)
 
 ### Step 4 — Workers pick up their own cards
 
 There is no central dispatcher — agents self-serve from the board:
 
 ```bash
-kanban claim --any --assignee researcher --actor researcher   # best ready card assigned to me
-kanban show "$ID"                                             # read the card
-kanban comment "$ID" "started; will post findings"            # progress note in the feed
-kanban complete "$ID" --summary "..."                         # done
-kanban block "$ID" --reason "need credentials for X"          # stuck
+swrm claim --any --assignee researcher --actor researcher   # best ready card assigned to me
+swrm show "$ID"                                             # read the card
+swrm comment "$ID" "started; will post findings"            # progress note in the feed
+swrm complete "$ID" --summary "..."                         # done
+swrm block "$ID" --reason "need credentials for X"          # stuck
 ```
 
 ### Step 5 — Report back to the user
@@ -128,7 +130,21 @@ Tell them what you created in plain prose, naming the actual agents:
 > - **T3** (`analyst`): synthesizes T1 + T2 into a recommendation
 > - **T4** (`writer`): turns T3 into a CTO memo
 >
-> T1 and T2 are `ready` now. T3 starts when both finish. Follow along with `kanban watch` or `kanban show <id>`.
+> T1 and T2 are `ready` now. T3 starts when both finish. Follow along with `swrm dash` or `swrm show <id>`.
+
+## Following the work live
+
+```bash
+swrm dash                  # LIVE board in the terminal: columns re-render as work happens,
+                           # doing rows show [worker 12m30s] claim countdowns, feed at the bottom
+swrm dash --once           # single snapshot (default when piped)
+swrm dashboard             # alias of dash
+swrm watch                 # human-readable live feed of every mutation, Ctrl-C to stop
+swrm watch --json          # NDJSON stream — pipe into jq or another agent
+swrm watch --since 42      # replay the feed from event #42
+swrm board                 # static column view
+swrm events --task t_ab12cd34 --limit 100
+```
 
 ## Multiple machines — leader-follower mode
 
@@ -137,13 +153,13 @@ The board file is single-host SQLite, so across PCs one machine is the
 
 ```bash
 # leader PC — owns the database, serves the API
-kanban serve --host 0.0.0.0 --port 8765
+swrm serve --host 0.0.0.0 --port 8765
 
 # every other PC / agent
 export KANBAN_URL=http://leader:8765
-kanban add "task" --assignee researcher      # identical commands, run remotely
-kanban claim --any --assignee researcher
-kanban dash                                   # live board long-polled from the leader
+swrm add "task" --assignee researcher      # identical commands, run remotely
+swrm claim --any --assignee researcher
+swrm dash                                   # live board long-polled from the leader
 ```
 
 Claims stay atomic across all machines because only the leader touches the
@@ -151,30 +167,17 @@ database. `watch`/`dash` long-poll the leader's event feed. The API is
 unauthenticated — trusted LAN/VPN only. Same board on one PC? Just share
 `$KANBAN_DB` and skip `serve` entirely.
 
-## Following the work live
-
-```bash
-kanban dash                  # LIVE board in the terminal: columns re-render as work happens,
-                             # doing rows show [worker 12m30s] claim countdowns, feed at the bottom
-kanban dash --once           # single snapshot (default when piped)
-kanban watch                 # human-readable live feed of every mutation, Ctrl-C to stop
-kanban watch --json          # NDJSON stream — pipe into jq or another agent
-kanban watch --since 42      # replay the feed from event #42
-kanban board                 # static column view
-kanban events --task t_ab12cd34 --limit 100
-```
-
 ## Common patterns
 
 **Fan-out + fan-in (research → synthesize):** N research cards with no parents, one synthesis card with all of them as `--parent`s.
 
 **Parallel implementation + validation:** one implementer card makes the change while one researcher card verifies config/docs/source. A reviewer card can depend on both. Don't make the implementer own unrelated verification just because the user mentioned both in one sentence.
 
-**Pipeline with gates:** `planner → implementer → reviewer`, each stage's `--parent` pointing at the previous card. If the reviewer blocks, the operator unblocks with feedback (`kanban unblock`) or creates a new fix card.
+**Pipeline with gates:** `planner → implementer → reviewer`, each stage's `--parent` pointing at the previous card. If the reviewer blocks, the operator unblocks with feedback (`swrm unblock`) or creates a new fix card.
 
-**Same-agent queue:** N cards, all `--assignee` the same agent, no dependencies. The agent processes them in priority order (`--priority`, higher first) via repeated `kanban claim --any --assignee <name>`.
+**Same-agent queue:** N cards, all `--assignee` the same agent, no dependencies. The agent processes them in priority order (`--priority`, higher first) via repeated `swrm claim --any --assignee <name>`.
 
-**Human-in-the-loop:** any card can `kanban block <id> --reason "..."` to wait for input; the comment thread (`kanban comment`) carries the context.
+**Human-in-the-loop:** any card can `swrm block <id> --reason "..."` to wait for input; the comment thread (`swrm comment`) carries the context.
 
 ## Pitfalls
 
@@ -188,25 +191,25 @@ kanban events --task t_ab12cd34 --limit 100
 
 **Reassignment vs. new task.** If a reviewer blocks with "needs changes," create a NEW card with `--parent <reviewer-card>` assigned to the original implementer — don't just unblock the same card.
 
-**Argument order for links.** `kanban link <parent> <child>` — parent first. Mixing them up demotes the wrong task to `todo`.
+**Argument order for links.** `swrm link <parent> <child>` — parent first. Mixing them up demotes the wrong task to `todo`.
 
 **Don't pre-create the whole graph if the shape depends on intermediate findings.** Let the synthesis card exist as "read parent handoffs and plan the rest." Orchestrators can spawn orchestrators.
 
-**Board selection.** If `$KANBAN_DB` is set, every agent must use the same board — pass `--db "$KANBAN_DB"` (or export the env var) on every call so cards stay in the same namespace.
+**Board selection.** If `$KANBAN_DB` is set, every agent must use the same board — pass `--db "$KANBAN_DB"` (or export the env var) on every call so cards stay in the same namespace. Across PCs, use `$KANBAN_URL` instead.
 
 ## Long-running cards (persistent workers)
 
-A worker normally gets one shot at a card: claim, work, `kanban complete`/`kanban block`. For open-ended cards where one pass rarely finishes the job:
+A worker normally gets one shot at a card: claim, work, `swrm complete`/`swrm block`. For open-ended cards where one pass rarely finishes the job:
 
 - Write the body as **explicit acceptance criteria** — "Translate every section of the README to French; no English sentences remain" beats "translate the README".
-- Claim with a long TTL: `kanban claim <id> --ttl 86400`.
-- Post progress with `kanban comment <id> "..."` so the feed shows the card is alive.
-- If the claim expires while work continues, `kanban reclaim` (or the worker re-claiming after `kanban release`) puts it back — never leave a stale `doing` card without a comment.
+- Claim with a long TTL: `swrm claim <id> --ttl 86400`.
+- Post progress with `swrm comment <id> "..."` so the feed shows the card is alive.
+- If the claim expires while work continues, `swrm reclaim` (or the worker re-claiming after `swrm release`) puts it back — never leave a stale `doing` card without a comment.
 
 ## Recovering stuck cards
 
 When a card sits in `doing` forever (crashed worker, lost agent):
 
-1. **Reclaim** — `kanban reclaim` releases all expired claims back to `ready` (claim TTL is 900s by default). For one specific card: `kanban reclaim <id> --force`.
-2. **Reassign** — `kanban assign <id> <new-agent>` after `kanban release <id> --force`, so another agent can `kanban claim` it fresh.
-3. **Check the trail** — `kanban show <id>` prints the full event history; hallucinated or missing handoffs show up there and stay there for debugging.
+1. **Reclaim** — `swrm reclaim` releases all expired claims back to `ready` (claim TTL is 900s by default). For one specific card: `swrm reclaim <id> --force`.
+2. **Reassign** — `swrm assign <id> <new-agent>` after `swrm release <id> --force`, so another agent can `swrm claim` it fresh.
+3. **Check the trail** — `swrm show <id>` prints the full event history; hallucinated or missing handoffs show up there and stay there for debugging.
