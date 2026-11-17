@@ -114,10 +114,10 @@ talks HTTP. All commands work unchanged — set one env var on the followers:
 
 ```bash
 # PC1 — the leader (owns the database)
-swrm serve --host 0.0.0.0 --port 8765        # bind 127.0.0.1 for localhost-only
+swrm serve --host 0.0.0.0 --port 8765 --passkey s3cret   # bind 127.0.0.1 for localhost-only
 
 # PC2, PC3, ... — followers
-export KANBAN_URL=http://pc1:8765
+export KANBAN_URL=http://pc1:8765 KANBAN_PASSKEY=s3cret  # or --passkey s3cret per command
 swrm add "task from pc2" --assignee qa
 swrm claim --any --assignee qa --actor qa
 swrm dash                                     # live board, long-polled from the leader
@@ -135,8 +135,11 @@ swrm dash       <──GET /snapshot / /events?since=N (long-poll)──
 - `watch`/`dash` on followers long-poll `GET /events?since=N` / `GET /snapshot`,
   so the live feed works over the network with ~LAN-latency updates.
 - `--url http://pc1:8765` works per-command as an alternative to `$KANBAN_URL`.
-- The HTTP API is unauthenticated (stdlib `http.server`) — use it on trusted
-  LANs/VPNs only; put it behind a reverse proxy with auth if you expose it.
+- **Passkey**: `swrm serve --passkey SECRET` (or `$KANBAN_PASSKEY`) makes the
+  leader require an `X-Swrm-Passkey: SECRET` header on every request — anything
+  missing/wrong gets `401`. Followers set the same secret via
+  `KANBAN_PASSKEY` or `--passkey`. Without a passkey the API is open — trusted
+  LANs/VPNs only, or front it with an auth-ing reverse proxy.
 - HTTP endpoints: `POST /cmd/<command>` (any CLI command, JSON args),
   `GET /events?since=N&timeout=25` (long-poll feed), `GET /events?max=1` (latest),
   `GET /snapshot?feed=N`, `GET /health`.
@@ -164,7 +167,8 @@ swrm dash       <──GET /snapshot / /events?since=N (long-poll)──
 | `swrm rm <id>` | archive |
 | `swrm events [--task ID] [--limit N]` | dump the change feed |
 | `swrm watch [--json] [--since N] [--interval S]` | stream the change feed live (Ctrl-C to stop) |
-| `swrm serve [--host H] [--port P]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL` |
+| `swrm serve [--host H] [--port P] [--passkey K]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL`; `--passkey` requires followers to authenticate |
+| all commands | `--url http://leader:8765` / `$KANBAN_URL` to run remotely; `--passkey` / `$KANBAN_PASSKEY` to authenticate |
 
 ## The swarmboard skill
 

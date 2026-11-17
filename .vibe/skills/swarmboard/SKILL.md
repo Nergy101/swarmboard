@@ -152,19 +152,21 @@ The board file is single-host SQLite, so across PCs one machine is the
 **leader** and the rest are followers:
 
 ```bash
-# leader PC — owns the database, serves the API
-swrm serve --host 0.0.0.0 --port 8765
+# leader PC — owns the database, serves the API (passkey recommended)
+swrm serve --host 0.0.0.0 --port 8765 --passkey s3cret
 
 # every other PC / agent
-export KANBAN_URL=http://leader:8765
+export KANBAN_URL=http://leader:8765 KANBAN_PASSKEY=s3cret
 swrm add "task" --assignee researcher      # identical commands, run remotely
 swrm claim --any --assignee researcher
 swrm dash                                   # live board long-polled from the leader
 ```
 
 Claims stay atomic across all machines because only the leader touches the
-database. `watch`/`dash` long-poll the leader's event feed. The API is
-unauthenticated — trusted LAN/VPN only. Same board on one PC? Just share
+database. `watch`/`dash` long-poll the leader's event feed. With `--passkey`
+set on the leader, every request must carry the matching `X-Swrm-Passkey`
+header (followers: `$KANBAN_PASSKEY` or `--passkey`); without it the API is
+open — trusted LAN/VPN only. Same board on one PC? Just share
 `$KANBAN_DB` and skip `serve` entirely.
 
 ## Common patterns

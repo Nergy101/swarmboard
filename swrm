@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -862,6 +863,7 @@ def _snapshot(db_path, feed_lines):
 
 class KanbanHandler(BaseHTTPRequestHandler):
     db_path = None
+    passkey = None  # when set, every request must carry X-Swrm-Passkey
 
     def log_message(self, *a):
         pass
@@ -874,7 +876,15 @@ class KanbanHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self):
+        if not KanbanHandler.passkey:
+            return True
+        return self.headers.get("X-Swrm-Passkey") == KanbanHandler.passkey
+
     def do_GET(self):
+        if not self._authorized():
+            self._send_json({"error": "unauthorized: bad or missing passkey"}, 401)
+            return
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         if u.path == "/health":
@@ -891,6 +901,9 @@ class KanbanHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
+        if not self._authorized():
+            self._send_json({"error": "unauthorized: bad or missing passkey"}, 401)
+            return
         if self.path.startswith("/cmd/"):
             name = urllib.parse.unquote(self.path[len("/cmd/"):])
             length = int(self.headers.get("Content-Length", 0))
@@ -913,10 +926,13 @@ def cmd_serve(args):
     path = resolve_db(args)
     connect(path)  # ensure schema exists
     KanbanHandler.db_path = path
+    KanbanHandler.passkey = args.passkey or os.environ.get("KANBAN_PASSKEY") or None
     srv = ThreadingHTTPServer((args.host, args.port), KanbanHandler)
     print(f"swarmboard leader serving {path}")
     print(f"  http://{args.host}:{args.port}  (Ctrl-C to stop)")
-    print(f"followers: export KANBAN_URL=http://<this-host>:{args.port}")
+    print(f"  passkey: {'set' if KanbanHandler.passkey else 'NOT set (open API, trusted networks only)'}")
+    print(f"followers: export KANBAN_URL=http://<this-host>:{args.port}" +
+          (" KANBAN_PASSKEY=<same-secret>" if KanbanHandler.passkey else ""))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -927,20 +943,35 @@ def cmd_serve(args):
 
 # ---------------------------------------------------------------- remote client
 
-def _remote_get(url, path, timeout=70):
-    with urllib.request.urlopen(url.rstrip("/") + path, timeout=timeout) as r:
+def _passkey(args):
+    return getattr(args, "passkey", None) or os.environ.get("KANBAN_PASSKEY")
+
+
+def _remote_get(url, path, passkey=None, timeout=70):
+    headers = {"X-Swrm-Passkey": passkey} if passkey else {}
+    req = urllib.request.Request(url.rstrip("/") + path, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
 def remote_post(url, args):
     payload = {k: v for k, v in vars(args).items() if k != "func"}
+    headers = {"Content-Type": "application/json"}
+    pk = _passkey(args)
+    if pk:
+        headers["X-Swrm-Passkey"] = pk
     req = urllib.request.Request(
         url.rstrip("/") + "/cmd/" + urllib.parse.quote(args.cmd),
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        res = json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die("unauthorized: leader requires a passkey (set --passkey or $KANBAN_PASSKEY)", 1)
+        raise
     if res.get("stdout"):
         sys.stdout.write(res["stdout"])
     if res.get("stderr"):
@@ -958,13 +989,13 @@ def _print_event(e, as_json):
 def remote_watch(args, url):
     since = args.since
     if since is None:
-        latest = _remote_get(url, "/events?since=0&max=1&timeout=0")["events"]
+        latest = _remote_get(url, "/events?since=0&max=1&timeout=0", _passkey(args))["events"]
         since = latest[-1]["id"] if latest else 0
     if not args.json:
         print(f"watching {url} (feed from event #{since + 1}); Ctrl-C to stop", file=sys.stderr)
     try:
         while True:
-            evs = _remote_get(url, f"/events?since={since}&timeout=25")["events"]
+            evs = _remote_get(url, f"/events?since={since}&timeout=25", _passkey(args))["events"]
             for e in evs:
                 since = e["id"]
                 _print_event(e, args.json)
@@ -977,7 +1008,7 @@ def remote_dash(args, url):
     is_tty = sys.stdout.isatty()
     follow = args.follow or (is_tty and not args.once)
     if not follow:
-        snap = _remote_get(url, f"/snapshot?feed={args.feed}")
+        snap = _remote_get(url, f"/snapshot?feed={args.feed}", _passkey(args))
         print(render_frame(snap["tasks"], snap["events"], url, args.feed))
         return
     out = sys.stdout
@@ -986,7 +1017,7 @@ def remote_dash(args, url):
         out.flush()
     try:
         while True:
-            snap = _remote_get(url, f"/snapshot?feed={args.feed}")
+            snap = _remote_get(url, f"/snapshot?feed={args.feed}", _passkey(args))
             frame = render_frame(snap["tasks"], snap["events"], url, args.feed)
             if is_tty:
                 out.write("\033[H\033[2J" + frame + "\n")
@@ -1010,6 +1041,7 @@ def build_parser():
     common.add_argument("--actor", help="actor name recorded in the feed (default: $KANBAN_ACTOR or $USER)")
     common.add_argument("--json", action="store_true", help="machine-readable JSON output")
     common.add_argument("--url", help="leader URL (default: $KANBAN_URL); when set, commands run remotely over HTTP")
+    common.add_argument("--passkey", help="shared secret for leader-follower mode (default: $KANBAN_PASSKEY); sent as X-Swrm-Passkey header")
 
     p = argparse.ArgumentParser(
         prog="swrm",
@@ -1131,7 +1163,7 @@ def build_parser():
                         help="run the leader server: other PCs connect via KANBAN_URL (leader-follower mode)")
     sv.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1; use 0.0.0.0 for LAN)")
     sv.add_argument("--port", type=int, default=8765, help="port (default 8765)")
-    sv.set_defaults(func=cmd_serve)
+    sv.set_defaults(func=cmd_serve)  # --passkey comes from the common parser
 
     return p
 
