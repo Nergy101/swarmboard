@@ -1,0 +1,904 @@
+#!/usr/bin/env python3
+"""kanban — CLI-first kanban board for multiple agents working at once.
+
+Single-file, stdlib-only. State lives in one SQLite database (WAL mode), so
+any number of agents/processes can read and write concurrently. Every mutation
+is appended to an `events` table in the same transaction; `kanban watch`
+streams that feed live.
+
+Board location: --db PATH, else $KANBAN_DB, else ./.kanban/kanban.db
+Actor identity: --actor NAME, else $KANBAN_ACTOR, else $USER, else "unknown"
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+
+STATUSES = ["todo", "ready", "doing", "done", "blocked", "archived"]
+ACTIVE_STATUSES = ["todo", "ready", "doing", "blocked"]
+DEFAULT_CLAIM_TTL = int(os.environ.get("KANBAN_CLAIM_TTL", "900"))  # seconds
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id               TEXT PRIMARY KEY,
+    title            TEXT NOT NULL,
+    body             TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'todo',
+    priority         INTEGER NOT NULL DEFAULT 0,
+    assignee         TEXT NOT NULL DEFAULT '',
+    labels           TEXT NOT NULL DEFAULT '',
+    result           TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    claimed_by       TEXT NOT NULL DEFAULT '',
+    claimed_at       TEXT NOT NULL DEFAULT '',
+    claim_expires_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS links (
+    parent_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    child_id  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (parent_id, child_id)
+);
+CREATE TABLE IF NOT EXISTS events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,
+    actor   TEXT NOT NULL,
+    action  TEXT NOT NULL,
+    task_id TEXT,
+    details TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
+CREATE INDEX IF NOT EXISTS idx_links_child    ON links(child_id);
+CREATE INDEX IF NOT EXISTS idx_events_id      ON events(id);
+"""
+
+
+# ---------------------------------------------------------------- helpers
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def resolve_db(args):
+    path = args.db or os.environ.get("KANBAN_DB") or os.path.join(".kanban", "kanban.db")
+    return os.path.abspath(path)
+
+
+def resolve_actor(args):
+    return args.actor or os.environ.get("KANBAN_ACTOR") or os.environ.get("USER") or "unknown"
+
+
+def connect(path, create=True):
+    if create:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+    con = sqlite3.connect(path, timeout=15, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=15000")
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA synchronous=NORMAL")
+    if create:
+        con.executescript(SCHEMA)
+    return con
+
+
+def emit(con, actor, action, task_id=None, **details):
+    con.execute(
+        "INSERT INTO events (ts, actor, action, task_id, details) VALUES (?,?,?,?,?)",
+        (now_iso(), actor, action, task_id, json.dumps(details, ensure_ascii=False)),
+    )
+
+
+def new_id():
+    return "t_" + uuid.uuid4().hex[:8]
+
+
+def row_to_task(r):
+    d = dict(r)
+    d["labels"] = [x for x in d["labels"].split(",") if x]
+    return d
+
+
+def get_task(con, task_id):
+    r = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not r:
+        die(f"no such task: {task_id}", 1)
+    return row_to_task(r)
+
+
+def parent_statuses(con, child_id):
+    rows = con.execute(
+        "SELECT p.id, p.status FROM links l JOIN tasks p ON p.id = l.parent_id WHERE l.child_id=?",
+        (child_id,),
+    ).fetchall()
+    return [(r["id"], r["status"]) for r in rows]
+
+
+def all_parents_done(con, child_id):
+    return all(s == "done" for _, s in parent_statuses(con, child_id))
+
+
+def promote_children(con, actor, parent_id):
+    """Promote todo children of parent_id whose parents are all done."""
+    kids = con.execute("SELECT child_id FROM links WHERE parent_id=?", (parent_id,)).fetchall()
+    for k in kids:
+        cid = k["child_id"]
+        t = con.execute("SELECT status FROM tasks WHERE id=?", (cid,)).fetchone()
+        if t and t["status"] == "todo" and all_parents_done(con, cid):
+            con.execute(
+                "UPDATE tasks SET status='ready', updated_at=? WHERE id=?", (now_iso(), cid)
+            )
+            emit(con, actor, "promoted", cid, reason=f"all parents done (incl. {parent_id})")
+
+
+def recheck_promotion(con, actor, child_id):
+    t = con.execute("SELECT status FROM tasks WHERE id=?", (child_id,)).fetchone()
+    if t and t["status"] == "todo" and all_parents_done(con, child_id):
+        con.execute("UPDATE tasks SET status='ready', updated_at=? WHERE id=?", (now_iso(), child_id))
+        emit(con, actor, "promoted", child_id, reason="all parents done")
+
+
+def touch(con, task_id):
+    con.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now_iso(), task_id))
+
+
+def die(msg, code=1):
+    print(f"kanban: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def out(args, human, data):
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        print(human)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(args):
+    path = resolve_db(args)
+    con = connect(path)
+    con.close()
+    out(args, f"initialized board at {path}", {"db": path})
+
+
+def cmd_add(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    parents = args.parent or []
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        for p in parents:
+            get_task(con, p)
+        tid = new_id()
+        ts = now_iso()
+        if args.status:
+            status = args.status
+        elif parents and not all(s == "done" for p in parents for s in [con.execute("SELECT status FROM tasks WHERE id=?", (p,)).fetchone()["status"]]):
+            status = "todo"
+        else:
+            status = "ready"
+        labels = ",".join(args.label or [])
+        con.execute(
+            "INSERT INTO tasks (id, title, body, status, priority, assignee, labels, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (tid, args.title, args.body or "", status, args.priority, args.assignee or "", labels, ts, ts),
+        )
+        for p in parents:
+            con.execute("INSERT INTO links (parent_id, child_id) VALUES (?,?)", (p, tid))
+        emit(con, actor, "created", tid, title=args.title, status=status,
+             assignee=args.assignee or "", priority=args.priority, parents=parents)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    task = get_task(con, tid)
+    con.close()
+    out(args, f"created {tid} [{status}] {args.title}", task)
+
+
+def _filter_query(args):
+    q = "SELECT * FROM tasks WHERE status != 'archived'"
+    params = []
+    if args.status:
+        q += " AND status=?"
+        params.append(args.status)
+    if args.assignee:
+        q += " AND assignee=?"
+        params.append(args.assignee)
+    if args.label:
+        q += " AND (',' || labels || ',') LIKE ?"
+        params.append(f"%,{args.label},%")
+    q += " ORDER BY priority DESC, created_at ASC"
+    return q, params
+
+
+def cmd_ls(args):
+    con = connect(resolve_db(args))
+    q, params = _filter_query(args)
+    rows = [row_to_task(r) for r in con.execute(q, params).fetchall()]
+    con.close()
+    if args.json:
+        out(args, "", rows)
+        return
+    if not rows:
+        print("(no tasks)")
+        return
+    for t in rows:
+        labels = f" #{','.join(t['labels'])}" if t["labels"] else ""
+        claim = f" claimed-by:{t['claimed_by']}" if t["status"] == "doing" else ""
+        assignee = f" @{t['assignee']}" if t["assignee"] else ""
+        print(f"{t['id']}  [{t['status']:<7}] P{t['priority']}  {t['title']}{assignee}{claim}{labels}")
+
+
+def cmd_board(args):
+    con = connect(resolve_db(args))
+    rows = con.execute(
+        "SELECT * FROM tasks WHERE status != 'archived' ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    con.close()
+    tasks = [row_to_task(r) for r in rows]
+    if args.json:
+        out(args, "", {s: [t for t in tasks if t["status"] == s] for s in STATUSES if s != "archived"})
+        return
+    for s in ["todo", "ready", "doing", "blocked", "done"]:
+        col = [t for t in tasks if t["status"] == s]
+        print(f"== {s} ({len(col)}) " + "=" * max(0, 50 - len(s)))
+        for t in col:
+            assignee = f" @{t['assignee']}" if t["assignee"] else ""
+            claim = f" (claimed by {t['claimed_by']})" if t["status"] == "doing" else ""
+            print(f"  {t['id']}  P{t['priority']}  {t['title']}{assignee}{claim}")
+        if not col:
+            print("  (empty)")
+
+
+def cmd_show(args):
+    con = connect(resolve_db(args))
+    t = get_task(con, args.id)
+    parents = [r["parent_id"] for r in con.execute("SELECT parent_id FROM links WHERE child_id=?", (args.id,))]
+    children = [r["child_id"] for r in con.execute("SELECT child_id FROM links WHERE parent_id=?", (args.id,))]
+    events = [
+        dict(r) for r in con.execute(
+            "SELECT id, ts, actor, action, details FROM events WHERE task_id=? ORDER BY id", (args.id,)
+        )
+    ]
+    con.close()
+    t["parents"] = parents
+    t["children"] = children
+    t["history"] = events
+    if args.json:
+        out(args, "", t)
+        return
+    print(f"{t['id']}  [{t['status']}]  P{t['priority']}  {t['title']}")
+    if t["assignee"]:
+        print(f"  assignee: {t['assignee']}")
+    if t["labels"]:
+        print(f"  labels:   {', '.join(t['labels'])}")
+    if t["status"] == "doing":
+        print(f"  claimed:  by {t['claimed_by']} at {t['claimed_at']} (expires {t['claim_expires_at']})")
+    if t["result"]:
+        print(f"  result:   {t['result']}")
+    if t["body"]:
+        print(f"  body:\n    " + t["body"].replace("\n", "\n    "))
+    if parents:
+        print(f"  parents:  {', '.join(parents)}")
+    if children:
+        print(f"  children: {', '.join(children)}")
+    print(f"  created {t['created_at']}  updated {t['updated_at']}")
+    if events:
+        print("  history:")
+        for e in events:
+            print(f"    #{e['id']} {e['ts']} {e['actor']} {e['action']} {e['details']}")
+
+
+def _set_status(args, task_id, status, result=None, result_key="result"):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        t = get_task(con, task_id)
+        old = t["status"]
+        res = result if result is not None else t["result"]
+        con.execute(
+            "UPDATE tasks SET status=?, result=?, updated_at=?, claimed_by='', claimed_at='', claim_expires_at=? WHERE id=?",
+            (status, res, now_iso(), "", task_id),
+        )
+        emit(con, actor, status, task_id, prev=old, **({result_key: res} if res else {}))
+        if status == "done":
+            promote_children(con, actor, task_id)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    t = get_task(con, task_id)
+    con.close()
+    return t
+
+
+def cmd_move(args):
+    if args.status not in STATUSES:
+        die(f"status must be one of: {', '.join(STATUSES)}", 2)
+    t = _set_status(args, args.id, args.status)
+    out(args, f"{t['id']} -> {args.status}", t)
+
+
+def cmd_complete(args):
+    t = _set_status(args, args.id, "done", result=args.summary or "", result_key="summary")
+    out(args, f"{t['id']} done", t)
+
+
+def cmd_block(args):
+    t = _set_status(args, args.id, "blocked", result=args.reason or "", result_key="reason")
+    out(args, f"{t['id']} blocked", t)
+
+
+def cmd_unblock(args):
+    t = _set_status(args, args.id, "ready")
+    out(args, f"{t['id']} -> ready", t)
+
+
+def cmd_claim(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    ttl = args.ttl if args.ttl is not None else DEFAULT_CLAIM_TTL
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        if args.any:
+            q = "SELECT id FROM tasks WHERE status='ready'"
+            params = []
+            if args.assignee:
+                q += " AND assignee=?"
+                params.append(args.assignee)
+            q += " ORDER BY priority DESC, created_at ASC LIMIT 1"
+            r = con.execute(q, params).fetchone()
+            if not r:
+                con.execute("ROLLBACK")
+                con.close()
+                die("no claimable ready task" + (f" for assignee '{args.assignee}'" if args.assignee else ""), 1)
+            task_id = r["id"]
+        else:
+            task_id = args.id
+            get_task(con, task_id)
+        exp = (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        cur = con.execute(
+            "UPDATE tasks SET status='doing', claimed_by=?, claimed_at=?, claim_expires_at=?, updated_at=?"
+            " WHERE id=? AND status='ready'",
+            (actor, now_iso(), exp, now_iso(), task_id),
+        )
+        if cur.rowcount == 0:
+            con.execute("ROLLBACK")
+            con.close()
+            die(f"{task_id} is not in 'ready' (already claimed or moved)", 1)
+        emit(con, actor, "claimed", task_id, ttl_seconds=ttl, expires=exp)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    t = get_task(con, task_id)
+    con.close()
+    out(args, f"claimed {t['id']} by {actor} (expires {t['claim_expires_at']})", t)
+
+
+def cmd_release(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        t = get_task(con, args.id)
+        if t["status"] != "doing":
+            con.execute("ROLLBACK")
+            con.close()
+            die(f"{args.id} is not claimed (status={t['status']})", 1)
+        if t["claimed_by"] != actor and not args.force:
+            con.execute("ROLLBACK")
+            con.close()
+            die(f"{args.id} is claimed by {t['claimed_by']}, not you ({actor}); use --force", 1)
+        con.execute(
+            "UPDATE tasks SET status='ready', claimed_by='', claimed_at='', claim_expires_at='', updated_at=? WHERE id=?",
+            (now_iso(), args.id),
+        )
+        emit(con, actor, "released", args.id, prev_claim=t["claimed_by"])
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    t = get_task(con, args.id)
+    con.close()
+    out(args, f"released {t['id']} -> ready", t)
+
+
+def cmd_reclaim(args):
+    """Release expired claims (or one specific task with --force)."""
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        now = now_iso()
+        if args.id:
+            t = get_task(con, args.id)
+            if t["status"] != "doing":
+                con.execute("ROLLBACK")
+                con.close()
+                die(f"{args.id} is not claimed (status={t['status']})", 1)
+            if not args.force and t["claim_expires_at"] >= now:
+                con.execute("ROLLBACK")
+                con.close()
+                die(f"{args.id} claim not expired yet (expires {t['claim_expires_at']}); use --force", 1)
+            ids = [(args.id, t["claimed_by"])]
+        else:
+            rows = con.execute(
+                "SELECT id, claimed_by FROM tasks WHERE status='doing' AND claim_expires_at < ?", (now,)
+            ).fetchall()
+            ids = [(r["id"], r["claimed_by"]) for r in rows]
+        for tid, owner in ids:
+            con.execute(
+                "UPDATE tasks SET status='ready', claimed_by='', claimed_at='', claim_expires_at='', updated_at=? WHERE id=?",
+                (now_iso(), tid),
+            )
+            emit(con, actor, "reclaimed", tid, prev_claim=owner, reason="claim expired" if not args.force else "forced")
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    con.close()
+    if args.json:
+        out(args, "", [{"id": i, "prev_claim": o} for i, o in ids])
+    else:
+        for i, o in ids:
+            print(f"reclaimed {i} (was claimed by {o}) -> ready")
+        if not ids:
+            print("(no expired claims)")
+
+
+def cmd_assign(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        t = get_task(con, args.id)
+        con.execute("UPDATE tasks SET assignee=?, updated_at=? WHERE id=?", (args.assignee, now_iso(), args.id))
+        emit(con, actor, "assigned", args.id, assignee=args.assignee, prev=t["assignee"])
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    t = get_task(con, args.id)
+    con.close()
+    out(args, f"{t['id']} assigned to {args.assignee or '(none)'}", t)
+
+
+def cmd_edit(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        t = get_task(con, args.id)
+        title = args.title if args.title is not None else t["title"]
+        body = args.body if args.body is not None else t["body"]
+        priority = args.priority if args.priority is not None else t["priority"]
+        labels = ",".join(args.label) if args.label is not None else ",".join(t["labels"])
+        con.execute(
+            "UPDATE tasks SET title=?, body=?, priority=?, labels=?, updated_at=? WHERE id=?",
+            (title, body, priority, labels, now_iso(), args.id),
+        )
+        emit(con, actor, "edited", args.id, title=title)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    t = get_task(con, args.id)
+    con.close()
+    out(args, f"edited {t['id']}", t)
+
+
+def cmd_link(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        get_task(con, args.parent)
+        child = get_task(con, args.child)
+        if args.parent == args.child:
+            con.execute("ROLLBACK")
+            con.close()
+            die("cannot link a task to itself", 2)
+        con.execute("INSERT OR IGNORE INTO links (parent_id, child_id) VALUES (?,?)", (args.parent, args.child))
+        emit(con, actor, "linked", args.child, parent=args.parent)
+        # A child with unfinished parents must not be runnable.
+        if child["status"] in ("ready", "doing") and not all_parents_done(con, args.child):
+            con.execute("UPDATE tasks SET status='todo', updated_at=? WHERE id=?", (now_iso(), args.child))
+            emit(con, actor, "demoted", args.child, reason=f"parent {args.parent} not done")
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    con.close()
+    out(args, f"linked {args.parent} -> {args.child}", {"parent": args.parent, "child": args.child})
+
+
+def cmd_unlink(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        cur = con.execute("DELETE FROM links WHERE parent_id=? AND child_id=?", (args.parent, args.child))
+        if cur.rowcount == 0:
+            con.execute("ROLLBACK")
+            con.close()
+            die(f"no link {args.parent} -> {args.child}", 1)
+        emit(con, actor, "unlinked", args.child, parent=args.parent)
+        recheck_promotion(con, actor, args.child)
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    con.close()
+    out(args, f"unlinked {args.parent} -> {args.child}", {"parent": args.parent, "child": args.child})
+
+
+def cmd_comment(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        get_task(con, args.id)
+        emit(con, actor, "commented", args.id, text=args.text)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    con.close()
+    out(args, f"comment added to {args.id}", {"task_id": args.id, "text": args.text})
+
+
+def cmd_rm(args):
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        t = get_task(con, args.id)
+        con.execute("UPDATE tasks SET status='archived', updated_at=? WHERE id=?", (now_iso(), args.id))
+        emit(con, actor, "archived", args.id, prev=t["status"])
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    con.close()
+    out(args, f"archived {args.id}", {"id": args.id})
+
+
+def cmd_events(args):
+    con = connect(resolve_db(args))
+    q = "SELECT id, ts, actor, action, task_id, details FROM events"
+    params = []
+    if args.task:
+        q += " WHERE task_id=?"
+        params.append(args.task)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(args.limit)
+    rows = [dict(r) for r in con.execute(q, params).fetchall()]
+    con.close()
+    rows.reverse()
+    if args.json:
+        out(args, "", rows)
+        return
+    for e in rows:
+        print(f"#{e['id']:<6} {e['ts']}  {e['actor']:<12} {e['action']:<10} {e['task_id'] or '-':<10} {e['details']}")
+
+
+def cmd_watch(args):
+    """Stream the change feed live. Ctrl-C to stop."""
+    con = connect(resolve_db(args))
+    last = args.since
+    if last is None:
+        r = con.execute("SELECT COALESCE(MAX(id), 0) AS m FROM events").fetchone()
+        last = r["m"]
+    if not args.json:
+        print(f"watching {resolve_db(args)} (feed from event #{last + 1}); Ctrl-C to stop", file=sys.stderr)
+    try:
+        while True:
+            rows = con.execute(
+                "SELECT id, ts, actor, action, task_id, details FROM events WHERE id > ? ORDER BY id",
+                (last,),
+            ).fetchall()
+            for r in rows:
+                last = r["id"]
+                if args.json:
+                    print(json.dumps(dict(r), ensure_ascii=False), flush=True)
+                else:
+                    print(f"#{r['id']:<6} {r['ts']}  {r['actor']:<12} {r['action']:<10} {r['task_id'] or '-':<10} {r['details']}", flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------- dashboard
+
+STATUS_COLORS = {
+    "todo": "\033[33m",    # yellow
+    "ready": "\033[32m",   # green
+    "doing": "\033[36m",   # cyan
+    "blocked": "\033[31m", # red
+    "done": "\033[2m",     # dim
+}
+RESET = "\033[0m"
+
+
+def _truncate(s, w):
+    if w <= 3:
+        return s[:w]
+    return s if len(s) <= w else s[: w - 3] + "..."
+
+
+def _fmt_remaining(expires_iso):
+    try:
+        exp = datetime.fromisoformat(expires_iso.replace("Z", "+00:00"))
+        secs = int((exp - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return "?"
+    if secs < 0:
+        return "EXPIRED"
+    m, s = divmod(secs, 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+def render_frame(con, db_path, feed_lines):
+    width, height = shutil.get_terminal_size((100, 30))
+    width = max(60, width)
+    no_color = bool(os.environ.get("NO_COLOR"))
+    C = STATUS_COLORS if not no_color else {k: "" for k in STATUS_COLORS}
+    R = "" if no_color else RESET
+
+    tasks = [row_to_task(r) for r in con.execute(
+        "SELECT * FROM tasks WHERE status != 'archived' ORDER BY priority DESC, created_at ASC"
+    ).fetchall()]
+    counts = {s: sum(1 for t in tasks if t["status"] == s) for s in STATUSES}
+    events = [dict(r) for r in con.execute(
+        "SELECT id, ts, actor, action, task_id, details FROM events ORDER BY id DESC LIMIT ?",
+        (feed_lines,),
+    ).fetchall()]
+    events.reverse()
+
+    lines = []
+    lines.append(_truncate(f" KANBAN {db_path}   {now_iso()}", width))
+    counts_str = "  ".join(f"{C[s]}{s}:{counts.get(s, 0)}{R}" for s in ["todo", "ready", "doing", "blocked", "done"])
+    lines.append(counts_str)
+    lines.append("-" * width)
+
+    cols = ["todo", "ready", "doing", "blocked"]
+    if width >= 100:
+        cols.append("done")
+    n = len(cols)
+    col_w = max(16, (width - (n - 1)) // n)
+
+    def task_line(t):
+        # identity first (id, priority, worker) so it survives truncation at narrow widths
+        base = f"{t['id']} P{t['priority']}"
+        if t["status"] == "doing" and t["claimed_by"]:
+            base += f" [{t['claimed_by']} {_fmt_remaining(t['claim_expires_at'])}]"
+        elif t["assignee"]:
+            base += f" @{t['assignee']}"
+        return base + f" {t['title']}"
+
+    col_tasks = {}
+    for s in cols:
+        ts = [t for t in tasks if t["status"] == s]
+        if s == "done":
+            ts = sorted(ts, key=lambda t: t["updated_at"], reverse=True)
+        col_tasks[s] = ts
+
+    max_rows = max(3, height - 4 - feed_lines)
+    header_cells = [C[s] + _truncate(f"{s.upper()} ({counts.get(s, 0)})", col_w).ljust(col_w) + R for s in cols]
+    lines.append(" ".join(header_cells))
+    lines.append(" ".join("-" * col_w for _ in cols))
+    for i in range(max_rows):
+        cells = []
+        for s in cols:
+            ts = col_tasks[s]
+            cells.append(_truncate(task_line(ts[i]), col_w).ljust(col_w) if i < len(ts) else " " * col_w)
+        lines.append(" ".join(cells).rstrip())
+
+    lines.append("-" * width)
+    lines.append(" FEED (latest events)")
+    for e in events:
+        ts = e["ts"][11:19] if len(e["ts"]) >= 19 else e["ts"]
+        line = f"#{e['id']} {ts} {e['actor']} {e['action']} {e['task_id'] or '-'} {e['details']}"
+        lines.append(_truncate(line, width))
+    return "\n".join(lines)
+
+
+def cmd_dash(args):
+    path = resolve_db(args)
+    con = connect(path)
+    is_tty = sys.stdout.isatty()
+    follow = args.follow or (is_tty and not args.once)
+    if not follow:
+        print(render_frame(con, path, args.feed))
+        con.close()
+        return
+    out = sys.stdout
+    if is_tty:
+        out.write("\033[?1049h\033[?25l")  # alternate screen, hide cursor
+        out.flush()
+    try:
+        while True:
+            frame = render_frame(con, path, args.feed)
+            if is_tty:
+                out.write("\033[H\033[2J" + frame + "\n")
+            else:
+                out.write(f"\n---------- frame {now_iso()} ----------\n" + frame + "\n")
+            out.flush()
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if is_tty:
+            out.write("\033[?25h\033[?1049l\n")
+            out.flush()
+        con.close()
+
+
+# ---------------------------------------------------------------- parser
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--db", help="path to board database (default: $KANBAN_DB or ./.kanban/kanban.db)")
+    common.add_argument("--actor", help="actor name recorded in the feed (default: $KANBAN_ACTOR or $USER)")
+    common.add_argument("--json", action="store_true", help="machine-readable JSON output")
+
+    p = argparse.ArgumentParser(
+        prog="kanban",
+        description="CLI-first kanban board for multiple agents, with a live change feed.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", parents=[common], help="create the board database").set_defaults(func=cmd_init)
+
+    a = sub.add_parser("add", parents=[common], help="create a task")
+    a.add_argument("title")
+    a.add_argument("--body", default="")
+    a.add_argument("--assignee", default="")
+    a.add_argument("--priority", type=int, default=0)
+    a.add_argument("--label", action="append", help="repeatable")
+    a.add_argument("--parent", action="append", help="parent task id; repeatable. Child starts in 'todo' until all parents are done")
+    a.add_argument("--status", choices=STATUSES, help="override initial status")
+    a.set_defaults(func=cmd_add)
+
+    l = sub.add_parser("ls", parents=[common], help="list tasks")
+    l.add_argument("--status", choices=STATUSES)
+    l.add_argument("--assignee")
+    l.add_argument("--label")
+    l.set_defaults(func=cmd_ls)
+
+    sub.add_parser("board", parents=[common], help="column view of the board").set_defaults(func=cmd_board)
+
+    s = sub.add_parser("show", parents=[common], help="task detail + history")
+    s.add_argument("id")
+    s.set_defaults(func=cmd_show)
+
+    m = sub.add_parser("move", parents=[common], help="set status directly")
+    m.add_argument("id")
+    m.add_argument("status", choices=STATUSES)
+    m.set_defaults(func=cmd_move)
+
+    c = sub.add_parser("claim", parents=[common], help="claim a ready task (atomic)")
+    c.add_argument("id", nargs="?", help="task id; omit with --any to claim best ready task")
+    c.add_argument("--any", action="store_true", help="claim highest-priority ready task")
+    c.add_argument("--assignee", help="with --any: only tasks assigned to this agent")
+    c.add_argument("--ttl", type=int, help=f"claim TTL in seconds (default {DEFAULT_CLAIM_TTL})")
+    c.set_defaults(func=cmd_claim)
+
+    r = sub.add_parser("release", parents=[common], help="release your claim back to ready")
+    r.add_argument("id")
+    r.add_argument("--force", action="store_true", help="release someone else's claim")
+    r.set_defaults(func=cmd_release)
+
+    rc = sub.add_parser("reclaim", parents=[common], help="release expired claims back to ready")
+    rc.add_argument("id", nargs="?", help="specific task to reclaim")
+    rc.add_argument("--force", action="store_true", help="reclaim even if not expired")
+    rc.set_defaults(func=cmd_reclaim)
+
+    cp = sub.add_parser("complete", parents=[common], help="mark done; promotes children whose parents are all done")
+    cp.add_argument("id")
+    cp.add_argument("--summary", default="")
+    cp.set_defaults(func=cmd_complete)
+
+    b = sub.add_parser("block", parents=[common], help="mark blocked with a reason")
+    b.add_argument("id")
+    b.add_argument("--reason", default="")
+    b.set_defaults(func=cmd_block)
+
+    u = sub.add_parser("unblock", parents=[common], help="move blocked task back to ready")
+    u.add_argument("id")
+    u.set_defaults(func=cmd_unblock)
+
+    asg = sub.add_parser("assign", parents=[common], help="set assignee")
+    asg.add_argument("id")
+    asg.add_argument("assignee")
+    asg.set_defaults(func=cmd_assign)
+
+    e = sub.add_parser("edit", parents=[common], help="edit title/body/priority/labels")
+    e.add_argument("id")
+    e.add_argument("--title")
+    e.add_argument("--body")
+    e.add_argument("--priority", type=int)
+    e.add_argument("--label", action="append")
+    e.set_defaults(func=cmd_edit)
+
+    ln = sub.add_parser("link", parents=[common], help="link parent -> child (child waits for parent)")
+    ln.add_argument("parent")
+    ln.add_argument("child")
+    ln.set_defaults(func=cmd_link)
+
+    ul = sub.add_parser("unlink", parents=[common], help="remove a parent -> child link")
+    ul.add_argument("parent")
+    ul.add_argument("child")
+    ul.set_defaults(func=cmd_unlink)
+
+    cm = sub.add_parser("comment", parents=[common], help="add a note to a task's history")
+    cm.add_argument("id")
+    cm.add_argument("text")
+    cm.set_defaults(func=cmd_comment)
+
+    rm = sub.add_parser("rm", parents=[common], help="archive a task")
+    rm.add_argument("id")
+    rm.set_defaults(func=cmd_rm)
+
+    ev = sub.add_parser("events", parents=[common], help="dump the change feed")
+    ev.add_argument("--task", help="only events for this task")
+    ev.add_argument("--limit", type=int, default=50)
+    ev.set_defaults(func=cmd_events)
+
+    w = sub.add_parser("watch", parents=[common], help="stream the change feed live (Ctrl-C to stop)")
+    w.add_argument("--since", type=int, help="event id to start after (default: latest)")
+    w.add_argument("--interval", type=float, default=0.2, help="poll interval seconds (default 0.2)")
+    w.set_defaults(func=cmd_watch)
+
+    d = sub.add_parser("dash", aliases=["dashboard", "live"], parents=[common],
+                       help="live-updating board view in the terminal (Ctrl-C to stop)")
+    d.add_argument("--interval", type=float, default=0.5, help="refresh seconds (default 0.5)")
+    d.add_argument("--once", action="store_true", help="render one snapshot and exit (default when piped)")
+    d.add_argument("--follow", action="store_true", help="keep streaming frames even when not a TTY")
+    d.add_argument("--feed", type=int, default=8, help="feed lines to show at the bottom (default 8)")
+    d.set_defaults(func=cmd_dash)
+
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except sqlite3.OperationalError as e:
+        die(f"database busy or locked: {e}", 1)
+
+
+if __name__ == "__main__":
+    main()
