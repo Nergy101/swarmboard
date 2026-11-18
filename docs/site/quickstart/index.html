@@ -702,9 +702,10 @@ t_aa11 P1 @dev  t_bb22 P3 @qa   t_9f4b P0 [dev 14m59s] polish dashboard
 </code></pre>
 <p><code>doing</code> rows show <strong>which worker picked up which task</strong> and the time left on
 their claim. In the live full-screen view the column headers and feed stay
-pinned while you scroll the task rows with ↑/↓ (or j/k); <code>q</code> quits. <code>swrm dash
---once</code> prints one snapshot (default when piped); <code>swrm watch --json</code> is the
-NDJSON feed for piping into other agents.</p>
+pinned; move the cursor with ↑/↓/←/→ (or hjkl) and press <strong>Enter or click a
+card</strong> to open a detail modal (history, parents/children, body); <code>q</code> closes the
+modal / quits. <code>swrm dash --once</code> prints one snapshot (default when piped);
+<code>swrm watch --json</code> is the NDJSON feed for piping into other agents.</p>
 <h2 id="lifecycle">Lifecycle<a class="headerlink" href="#lifecycle" title="Permanent link">&para;</a></h2>
 <pre><code>todo ──(all parents done)──&gt; ready ──(claim)──&gt; doing ──&gt; done
                                             └───────&gt; blocked ──(unblock)──&gt; ready

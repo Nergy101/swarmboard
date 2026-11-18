@@ -791,15 +791,89 @@ def render_frame(tasks, events, title, feed_lines):
     return "\n".join(lines)
 
 
-def _curses_dash(snap, title, args):
-    """Full-screen dashboard TUI: column headers and feed stay pinned while the
-    task rows scroll (up/down or k/j). q or Ctrl-C quits. Falls back to the
-    plain frame loop if curses is unavailable."""
+def _wrap_lines(text, width):
+    import textwrap
+    out = []
+    for para in text.split("\n"):
+        out.extend(textwrap.wrap(para, width) or [""])
+    return out
+
+
+def _modal_lines(t, det):
+    lines = [f"{t['id']}  [{t['status']}]  P{t['priority']}  {t['title']}", ""]
+    if t.get("assignee"):
+        lines.append(f"assignee:  {t['assignee']}")
+    if t.get("labels"):
+        lines.append(f"labels:    {', '.join(t['labels'])}")
+    if t["status"] == "doing" and t.get("claimed_by"):
+        lines.append(f"claimed:   by {t['claimed_by']} at {t['claimed_at']} "
+                     f"(expires {t['claim_expires_at']}, {_fmt_remaining(t['claim_expires_at'])} left)")
+    if t.get("result"):
+        lines.append(f"result:    {t['result']}")
+    lines.append(f"created:   {t['created_at']}")
+    lines.append(f"updated:   {t['updated_at']}")
+    if det:
+        if det.get("parents"):
+            lines.append(f"parents:   {', '.join(det['parents'])}")
+        if det.get("children"):
+            lines.append(f"children:  {', '.join(det['children'])}")
+    if t.get("body"):
+        lines.append("")
+        lines.append("body:")
+        lines.extend("  " + l for l in _wrap_lines(t["body"], 64))
+    if det and det.get("history"):
+        lines.append("")
+        lines.append("history:")
+        for e in det["history"]:
+            ts = e["ts"][11:19] if len(e["ts"]) >= 19 else e["ts"]
+            lines.append(f"  #{e['id']} {ts} {e['actor']} {e['action']} {e['details']}")
+    return lines
+
+
+def _show_modal(stdscr, t, det, attrs):
+    """Centered detail popup; up/down scroll, q/Esc/Enter closes."""
+    import curses
+    h, w = stdscr.getmaxyx()
+    content = _modal_lines(t, det)
+    mw = min(76, max(44, w - 4))
+    mh = max(8, min(h - 2, len(content) + 4))
+    win = curses.newwin(mh, mw, (h - mh) // 2, (w - mw) // 2)
+    win.keypad(True)
+    off = 0
+    while True:
+        maxvis = mh - 3
+        win.erase()
+        win.border()
+        win.addnstr(0, 2, f" {t['id']} ", mw - 4, attrs.get(t["status"], 0) | curses.A_BOLD)
+        for i in range(maxvis):
+            if off + i < len(content):
+                win.addnstr(1 + i, 2, content[off + i][: mw - 4], mw - 4)
+        if len(content) > maxvis:
+            win.addnstr(mh - 1, 2, f" {off + 1}-{min(off + maxvis, len(content))}/{len(content)}  up/down scroll, q close ", mw - 4, curses.A_DIM)
+        win.refresh()
+        ch = win.getch()
+        if ch in (ord("q"), 27, 10, 13, curses.KEY_ENTER):
+            break
+        if ch in (curses.KEY_UP, ord("k")):
+            off = max(0, off - 1)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            off = min(max(0, len(content) - maxvis), off + 1)
+    del win
+    stdscr.touchwin()
+    stdscr.refresh()
+
+
+def _curses_dash(snap, title, args, detail=None):
+    """Full-screen dashboard TUI: column headers and feed stay pinned. Move the
+    cursor with arrows or hjkl, open a card's detail modal with Enter or a mouse
+    click, q or Ctrl-C quits. Falls back to the plain frame loop if curses is
+    unavailable."""
     os.environ.setdefault("ESCDELAY", "25")  # snappy arrow-key parsing
     import curses
 
     def main(stdscr):
         curses.curs_set(0)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
         stdscr.timeout(max(100, int(args.interval * 1000)))
         if not os.environ.get("NO_COLOR") and curses.has_colors():
             curses.start_color()
@@ -813,6 +887,8 @@ def _curses_dash(snap, title, args):
         else:
             attrs = {s: 0 for s in STATUS_COLORS}
 
+        sel_col = 0
+        sel_row = 0
         offset = 0
         while True:
             tasks, events = snap()
@@ -826,8 +902,18 @@ def _curses_dash(snap, title, args):
             counts = {s: sum(1 for t in tasks if t["status"] == s) for s in STATUSES}
             cols, col_w = _board_columns(w)
             col_tasks = _column_tasks(tasks, cols)
+
             max_len = max((len(ts) for ts in col_tasks.values()), default=0)
-            offset = min(offset, max(0, max_len - rows))
+            sel_col = min(sel_col, len(cols) - 1)
+            sel_row = min(sel_row, max(0, max_len - 1))
+            if sel_row < offset:
+                offset = sel_row
+            if sel_row >= offset + rows:
+                offset = sel_row - rows + 1
+
+            def open_modal(t):
+                det = detail(t["id"]) if detail else None
+                _show_modal(stdscr, t, det, attrs)
 
             stdscr.erase()
             stdscr.addnstr(0, 0, _truncate(f" KANBAN {title}   {now_iso()}", w), w - 1)
@@ -847,14 +933,15 @@ def _curses_dash(snap, title, args):
                 x += col_w + 1
             for i in range(rows):
                 x = 0
-                for s in cols:
+                for ci, s in enumerate(cols):
                     ts = col_tasks[s]
                     j = offset + i
                     cell = _truncate(_task_line(ts[j]), col_w) if j < len(ts) else ""
-                    stdscr.addnstr(top + i, x, cell, col_w)
+                    attr = curses.A_REVERSE if (ci == sel_col and j == sel_row and j < len(ts)) else 0
+                    stdscr.addnstr(top + i, x, cell, col_w, attr)
                     x += col_w + 1
             stdscr.addnstr(bot, 0, "-" * (w - 1), w - 1)
-            stdscr.addnstr(bot + 1, 0, " FEED (latest events)", w - 1)
+            stdscr.addnstr(bot + 1, 0, " FEED (latest events)   [enter/click: card details · arrows/hjkl: move · q: quit]", w - 1)
             for i, e in enumerate(events[:feed_n]):
                 ts = e["ts"][11:19] if len(e["ts"]) >= 19 else e["ts"]
                 line = f"#{e['id']} {ts} {e['actor']} {e['action']} {e['task_id'] or '-'} {e['details']}"
@@ -865,9 +952,29 @@ def _curses_dash(snap, title, args):
             if ch in (ord("q"), 3):  # q or Ctrl-C
                 break
             if ch in (curses.KEY_UP, ord("k")):
-                offset = max(0, offset - 1)
+                sel_row = max(0, sel_row - 1)
             elif ch in (curses.KEY_DOWN, ord("j")):
-                offset += 1
+                sel_row += 1
+            elif ch in (curses.KEY_LEFT, ord("h")):
+                sel_col = max(0, sel_col - 1)
+            elif ch in (curses.KEY_RIGHT, ord("l")):
+                sel_col = min(len(cols) - 1, sel_col + 1)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                ts = col_tasks[cols[sel_col]]
+                if sel_row < len(ts):
+                    open_modal(ts[sel_row])
+            elif ch == curses.KEY_MOUSE:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                except curses.error:
+                    continue
+                if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED) and top <= my < bot:
+                    ci = min(len(cols) - 1, mx // (col_w + 1))
+                    r = offset + (my - top)
+                    ts = col_tasks[cols[ci]]
+                    if r < len(ts):
+                        sel_col, sel_row = ci, r
+                        open_modal(ts[r])
             elif ch == curses.KEY_RESIZE:
                 pass  # redrawn on next loop iteration
 
@@ -889,6 +996,17 @@ def cmd_dash(args):
         events.reverse()
         return tasks, events
 
+    def detail(tid):
+        r = con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if not r:
+            return None
+        t = dict(row_to_task(r))
+        t["parents"] = [x["parent_id"] for x in con.execute("SELECT parent_id FROM links WHERE child_id=?", (tid,))]
+        t["children"] = [x["child_id"] for x in con.execute("SELECT child_id FROM links WHERE parent_id=?", (tid,))]
+        t["history"] = [dict(x) for x in con.execute(
+            "SELECT id, ts, actor, action, details FROM events WHERE task_id=? ORDER BY id", (tid,))]
+        return t
+
     is_tty = sys.stdout.isatty()
     follow = args.follow or (is_tty and not args.once)
     if not follow:
@@ -898,7 +1016,7 @@ def cmd_dash(args):
         return
     if is_tty:
         try:
-            _curses_dash(snap, path, args)
+            _curses_dash(snap, path, args, detail)
         except Exception:
             pass  # curses unavailable/broken — fall back to the plain frame loop
         else:
@@ -1161,13 +1279,30 @@ def remote_dash(args, url):
         s = _remote_get(url, f"/snapshot?feed={args.feed}", _passkey(args))
         return s["tasks"], s["events"]
 
+    def detail(tid):
+        headers = {"Content-Type": "application/json"}
+        pk = _passkey(args)
+        if pk:
+            headers["X-Swrm-Passkey"] = pk
+        req = urllib.request.Request(
+            url.rstrip("/") + "/cmd/show",
+            data=json.dumps({"id": tid, "json": True}).encode(),
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                res = json.loads(r.read())
+            return json.loads(res["stdout"]) if res.get("stdout") else None
+        except Exception:
+            return None
+
     if not follow:
         tasks, events = snap()
         print(render_frame(tasks, events, url, args.feed))
         return
     if is_tty:
         try:
-            _curses_dash(snap, url, args)
+            _curses_dash(snap, url, args, detail)
         except Exception:
             pass  # curses unavailable/broken — fall back to the plain frame loop
         else:

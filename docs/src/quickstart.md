@@ -28,9 +28,10 @@ t_aa11 P1 @dev  t_bb22 P3 @qa   t_9f4b P0 [dev 14m59s] polish dashboard
 
 `doing` rows show **which worker picked up which task** and the time left on
 their claim. In the live full-screen view the column headers and feed stay
-pinned while you scroll the task rows with ↑/↓ (or j/k); `q` quits. `swrm dash
---once` prints one snapshot (default when piped); `swrm watch --json` is the
-NDJSON feed for piping into other agents.
+pinned; move the cursor with ↑/↓/←/→ (or hjkl) and press **Enter or click a
+card** to open a detail modal (history, parents/children, body); `q` closes the
+modal / quits. `swrm dash --once` prints one snapshot (default when piped);
+`swrm watch --json` is the NDJSON feed for piping into other agents.
 
 ## Lifecycle
 
