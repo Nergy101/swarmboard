@@ -721,14 +721,23 @@ def _fmt_remaining(expires_iso):
     return f"{m}m{s:02d}s" if m else f"{s}s"
 
 
-def _task_line(t):
-    # identity first (id, priority, worker) so it survives truncation at narrow widths
-    base = f"{t['id']} P{t['priority']}"
+CARD_H = 3  # each board cell is a mini-card: title (up to 2 lines) + meta line
+
+
+def _task_card(t, col_w):
+    """Render a task as a little card: human-readable title first (wrapped to the
+    column width, max 2 lines), then a dim meta line with id/priority/worker."""
+    wrapped = _wrap_lines(t["title"], col_w)[:2]
+    if len(_wrap_lines(t["title"], col_w)) > 2 and wrapped:
+        wrapped[-1] = _truncate(wrapped[-1], col_w)
+    while len(wrapped) < 2:
+        wrapped.append("")
+    meta = f"{t['id']} P{t['priority']}"
     if t["status"] == "doing" and t["claimed_by"]:
-        base += f" [{t['claimed_by']} {_fmt_remaining(t['claim_expires_at'])}]"
+        meta += f" [{t['claimed_by']} {_fmt_remaining(t['claim_expires_at'])}]"
     elif t["assignee"]:
-        base += f" @{t['assignee']}"
-    return base + f" {t['title']}"
+        meta += f" @{t['assignee']}"
+    return wrapped + [_truncate(meta, col_w)]
 
 
 def _board_columns(width):
@@ -769,18 +778,24 @@ def render_frame(tasks, events, title, feed_lines):
     col_tasks = _column_tasks(tasks, cols)
 
     # 7 chrome lines (title, counts, dash, header, dash, dash, FEED label) must
-    # fit inside the terminal together with the rows and the feed, otherwise
+    # fit inside the terminal together with the cards and the feed, otherwise
     # the frame overflows and the top lines (incl. column headers) scroll off.
-    max_rows = max(1, height - 7 - len(events))
+    slots = max(1, (height - 7 - len(events)) // CARD_H)
     header_cells = [C[s] + _truncate(f"{s.upper()} ({counts.get(s, 0)})", col_w).ljust(col_w) + R for s in cols]
     lines.append(" ".join(header_cells))
     lines.append(" ".join("-" * col_w for _ in cols))
-    for i in range(max_rows):
-        cells = []
-        for s in cols:
-            ts = col_tasks[s]
-            cells.append(_truncate(_task_line(ts[i]), col_w).ljust(col_w) if i < len(ts) else " " * col_w)
-        lines.append(" ".join(cells).rstrip())
+    dim = "\033[2m" if not no_color else ""
+    for i in range(slots):
+        for li in range(CARD_H):
+            cells = []
+            for s in cols:
+                ts = col_tasks[s]
+                if i < len(ts):
+                    txt = _truncate(_task_card(ts[i], col_w)[li], col_w).ljust(col_w)
+                    cells.append(dim + txt + R if li == CARD_H - 1 else txt)
+                else:
+                    cells.append(" " * col_w)
+            lines.append(" ".join(cells).rstrip())
 
     lines.append("-" * width)
     lines.append(" FEED (latest events)")
@@ -897,7 +912,7 @@ def _curses_dash(snap, title, args, detail=None):
             feed_n = min(args.feed, max(0, h - 12))
             top = 5                                   # title, counts, dash, header, dash
             bot = h - 2 - feed_n                      # dash, FEED label, feed lines
-            rows = max(1, bot - top)
+            slots = max(1, (bot - top) // CARD_H)     # visible mini-cards per column
 
             counts = {s: sum(1 for t in tasks if t["status"] == s) for s in STATUSES}
             cols, col_w = _board_columns(w)
@@ -908,8 +923,8 @@ def _curses_dash(snap, title, args, detail=None):
             sel_row = min(sel_row, max(0, max_len - 1))
             if sel_row < offset:
                 offset = sel_row
-            if sel_row >= offset + rows:
-                offset = sel_row - rows + 1
+            if sel_row >= offset + slots:
+                offset = sel_row - slots + 1
 
             def open_modal(t):
                 det = detail(t["id"]) if detail else None
@@ -931,15 +946,19 @@ def _curses_dash(snap, title, args, detail=None):
             for _ in cols:
                 stdscr.addnstr(4, x, "-" * col_w, col_w)
                 x += col_w + 1
-            for i in range(rows):
-                x = 0
-                for ci, s in enumerate(cols):
-                    ts = col_tasks[s]
-                    j = offset + i
-                    cell = _truncate(_task_line(ts[j]), col_w) if j < len(ts) else ""
-                    attr = curses.A_REVERSE if (ci == sel_col and j == sel_row and j < len(ts)) else 0
-                    stdscr.addnstr(top + i, x, cell, col_w, attr)
-                    x += col_w + 1
+            for i in range(slots):
+                for li in range(CARD_H):
+                    x = 0
+                    for ci, s in enumerate(cols):
+                        ts = col_tasks[s]
+                        j = offset + i
+                        if j < len(ts):
+                            cell = _truncate(_task_card(ts[j], col_w)[li], col_w)
+                            attr = curses.A_REVERSE if (ci == sel_col and j == sel_row) else (curses.A_DIM if li == CARD_H - 1 else 0)
+                        else:
+                            cell, attr = "", 0
+                        stdscr.addnstr(top + i * CARD_H + li, x, cell, col_w, attr)
+                        x += col_w + 1
             stdscr.addnstr(bot, 0, "-" * (w - 1), w - 1)
             stdscr.addnstr(bot + 1, 0, " FEED (latest events)   [enter/click: card details · arrows/hjkl: move · q: quit]", w - 1)
             for i, e in enumerate(events[:feed_n]):
@@ -970,7 +989,7 @@ def _curses_dash(snap, title, args, detail=None):
                     continue
                 if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED) and top <= my < bot:
                     ci = min(len(cols) - 1, mx // (col_w + 1))
-                    r = offset + (my - top)
+                    r = offset + (my - top) // CARD_H
                     ts = col_tasks[cols[ci]]
                     if r < len(ts):
                         sel_col, sel_row = ci, r

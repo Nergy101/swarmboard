@@ -22,9 +22,14 @@ todo:1  ready:2  doing:1  blocked:0  done:12
 ----------------------------------------------------------------
 TODO (1)        READY (2)       DOING (1)       BLOCKED (0)  DONE (12)
 --------------  --------------  --------------  -----------  ------
-t_aa11 P1 @dev  t_bb22 P3 @qa   t_9f4b P0 [dev 14m59s] polish dashboard
+research costs  ship the API    polish dashboard
+                t_bb22 P3 @qa   t_9f4b P0 [dev 14m59s]
+t_aa11 P1 @dev
  feed: #41 dev claimed t_9f4b ...  #42 qa done t_cc33 ...
 ```
+
+Each card shows the **title first** (wrapped to the column), with a dim meta
+line underneath (`id`, priority, assignee or claim time left).
 
 `doing` rows show **which worker picked up which task** and the time left on
 their claim. In the live full-screen view the column headers and feed stay
