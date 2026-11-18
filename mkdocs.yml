@@ -8,6 +8,8 @@ theme:
   name: material
   logo: images/logo.svg
   favicon: images/favicon.svg
+  palette:
+    - scheme: slate
   features:
     - navigation.tabs
     - navigation.sections

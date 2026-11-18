@@ -31,6 +31,9 @@
     
       <link rel="stylesheet" href="assets/stylesheets/main.57a0d79d.min.css">
       
+        
+        <link rel="stylesheet" href="assets/stylesheets/palette.fb2fffe2.min.css">
+      
       
 
 
@@ -57,7 +60,14 @@
   </head>
   
   
-    <body dir="ltr">
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
   
     
     <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
@@ -105,6 +115,18 @@
         </div>
       </div>
     </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-hidden="true"  type="radio" name="__palette" id="__palette_0">
+    
+  
+</form>
+      
     
     
       <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
@@ -650,7 +672,10 @@
 <p>A CLI-first kanban board (<code>swrm</code>) that any number of agents can work on <strong>at the
 same time</strong> — with a live terminal view and an immediate change feed.
 No server, no dependencies.</p>
-<p><img alt="swarmboard logo" src="images/logo.svg" />{ width="160" }</p>
+<p align="center">
+  <img src="images/logo.svg" alt="swarmboard logo" width="160"/>
+</p>
+
 <p>Most kanban tools assume one human at a keyboard. <strong>swarmboard</strong> assumes a
 <em>swarm</em>: many agents (and humans) claiming, commenting, blocking, and
 completing cards concurrently — and everyone sees it happen immediately.</p>

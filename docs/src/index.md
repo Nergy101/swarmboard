@@ -6,7 +6,9 @@ A CLI-first kanban board (`swrm`) that any number of agents can work on **at the
 same time** — with a live terminal view and an immediate change feed.
 No server, no dependencies.
 
-![swarmboard logo](images/logo.svg){ width="160" }
+<p align="center">
+  <img src="images/logo.svg" alt="swarmboard logo" width="160"/>
+</p>
 
 Most kanban tools assume one human at a keyboard. **swarmboard** assumes a
 *swarm*: many agents (and humans) claiming, commenting, blocking, and
