@@ -676,6 +676,35 @@ def _fmt_remaining(expires_iso):
     return f"{m}m{s:02d}s" if m else f"{s}s"
 
 
+def _task_line(t):
+    # identity first (id, priority, worker) so it survives truncation at narrow widths
+    base = f"{t['id']} P{t['priority']}"
+    if t["status"] == "doing" and t["claimed_by"]:
+        base += f" [{t['claimed_by']} {_fmt_remaining(t['claim_expires_at'])}]"
+    elif t["assignee"]:
+        base += f" @{t['assignee']}"
+    return base + f" {t['title']}"
+
+
+def _board_columns(width):
+    cols = ["todo", "ready", "doing", "blocked"]
+    if width >= 100:
+        cols.append("done")
+    n = len(cols)
+    col_w = max(16, (width - (n - 1)) // n)
+    return cols, col_w
+
+
+def _column_tasks(tasks, cols):
+    col_tasks = {}
+    for s in cols:
+        ts = [t for t in tasks if t["status"] == s]
+        if s == "done":
+            ts = sorted(ts, key=lambda t: t["updated_at"], reverse=True)
+        col_tasks[s] = ts
+    return col_tasks
+
+
 def render_frame(tasks, events, title, feed_lines):
     width, height = shutil.get_terminal_size((100, 30))
     width = max(60, width)
@@ -691,29 +720,13 @@ def render_frame(tasks, events, title, feed_lines):
     lines.append(counts_str)
     lines.append("-" * width)
 
-    cols = ["todo", "ready", "doing", "blocked"]
-    if width >= 100:
-        cols.append("done")
-    n = len(cols)
-    col_w = max(16, (width - (n - 1)) // n)
+    cols, col_w = _board_columns(width)
+    col_tasks = _column_tasks(tasks, cols)
 
-    def task_line(t):
-        # identity first (id, priority, worker) so it survives truncation at narrow widths
-        base = f"{t['id']} P{t['priority']}"
-        if t["status"] == "doing" and t["claimed_by"]:
-            base += f" [{t['claimed_by']} {_fmt_remaining(t['claim_expires_at'])}]"
-        elif t["assignee"]:
-            base += f" @{t['assignee']}"
-        return base + f" {t['title']}"
-
-    col_tasks = {}
-    for s in cols:
-        ts = [t for t in tasks if t["status"] == s]
-        if s == "done":
-            ts = sorted(ts, key=lambda t: t["updated_at"], reverse=True)
-        col_tasks[s] = ts
-
-    max_rows = max(3, height - 4 - feed_lines)
+    # 7 chrome lines (title, counts, dash, header, dash, dash, FEED label) must
+    # fit inside the terminal together with the rows and the feed, otherwise
+    # the frame overflows and the top lines (incl. column headers) scroll off.
+    max_rows = max(1, height - 7 - len(events))
     header_cells = [C[s] + _truncate(f"{s.upper()} ({counts.get(s, 0)})", col_w).ljust(col_w) + R for s in cols]
     lines.append(" ".join(header_cells))
     lines.append(" ".join("-" * col_w for _ in cols))
@@ -721,7 +734,7 @@ def render_frame(tasks, events, title, feed_lines):
         cells = []
         for s in cols:
             ts = col_tasks[s]
-            cells.append(_truncate(task_line(ts[i]), col_w).ljust(col_w) if i < len(ts) else " " * col_w)
+            cells.append(_truncate(_task_line(ts[i]), col_w).ljust(col_w) if i < len(ts) else " " * col_w)
         lines.append(" ".join(cells).rstrip())
 
     lines.append("-" * width)
@@ -731,6 +744,89 @@ def render_frame(tasks, events, title, feed_lines):
         line = f"#{e['id']} {ts} {e['actor']} {e['action']} {e['task_id'] or '-'} {e['details']}"
         lines.append(_truncate(line, width))
     return "\n".join(lines)
+
+
+def _curses_dash(snap, title, args):
+    """Full-screen dashboard TUI: column headers and feed stay pinned while the
+    task rows scroll (up/down or k/j). q or Ctrl-C quits. Falls back to the
+    plain frame loop if curses is unavailable."""
+    os.environ.setdefault("ESCDELAY", "25")  # snappy arrow-key parsing
+    import curses
+
+    def main(stdscr):
+        curses.curs_set(0)
+        stdscr.timeout(max(100, int(args.interval * 1000)))
+        if not os.environ.get("NO_COLOR") and curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            color_map = {"todo": curses.COLOR_YELLOW, "ready": curses.COLOR_GREEN,
+                         "doing": curses.COLOR_CYAN, "blocked": curses.COLOR_RED}
+            attrs = {"done": curses.A_DIM}
+            for i, (s, c) in enumerate(color_map.items(), start=1):
+                curses.init_pair(i, c, -1)
+                attrs[s] = curses.color_pair(i)
+        else:
+            attrs = {s: 0 for s in STATUS_COLORS}
+
+        offset = 0
+        while True:
+            tasks, events = snap()
+            h, w = stdscr.getmaxyx()
+            w = max(60, w)
+            feed_n = min(args.feed, max(0, h - 12))
+            top = 5                                   # title, counts, dash, header, dash
+            bot = h - 2 - feed_n                      # dash, FEED label, feed lines
+            rows = max(1, bot - top)
+
+            counts = {s: sum(1 for t in tasks if t["status"] == s) for s in STATUSES}
+            cols, col_w = _board_columns(w)
+            col_tasks = _column_tasks(tasks, cols)
+            max_len = max((len(ts) for ts in col_tasks.values()), default=0)
+            offset = min(offset, max(0, max_len - rows))
+
+            stdscr.erase()
+            stdscr.addnstr(0, 0, _truncate(f" KANBAN {title}   {now_iso()}", w), w - 1)
+            x = 1
+            for s in ["todo", "ready", "doing", "blocked", "done"]:
+                txt = f"{s}:{counts.get(s, 0)}  "
+                stdscr.addnstr(1, x, txt, w - 1 - x, attrs.get(s, 0))
+                x += len(txt)
+            stdscr.addnstr(2, 0, "-" * (w - 1), w - 1)
+            x = 0
+            for s in cols:
+                stdscr.addnstr(3, x, _truncate(f"{s.upper()} ({counts.get(s, 0)})", col_w), col_w, attrs.get(s, 0))
+                x += col_w + 1
+            x = 0
+            for _ in cols:
+                stdscr.addnstr(4, x, "-" * col_w, col_w)
+                x += col_w + 1
+            for i in range(rows):
+                x = 0
+                for s in cols:
+                    ts = col_tasks[s]
+                    j = offset + i
+                    cell = _truncate(_task_line(ts[j]), col_w) if j < len(ts) else ""
+                    stdscr.addnstr(top + i, x, cell, col_w)
+                    x += col_w + 1
+            stdscr.addnstr(bot, 0, "-" * (w - 1), w - 1)
+            stdscr.addnstr(bot + 1, 0, " FEED (latest events)", w - 1)
+            for i, e in enumerate(events[:feed_n]):
+                ts = e["ts"][11:19] if len(e["ts"]) >= 19 else e["ts"]
+                line = f"#{e['id']} {ts} {e['actor']} {e['action']} {e['task_id'] or '-'} {e['details']}"
+                stdscr.addnstr(bot + 2 + i, 0, _truncate(line, w - 1), w - 1)
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch in (ord("q"), 3):  # q or Ctrl-C
+                break
+            if ch in (curses.KEY_UP, ord("k")):
+                offset = max(0, offset - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                offset += 1
+            elif ch == curses.KEY_RESIZE:
+                pass  # redrawn on next loop iteration
+
+    curses.wrapper(main)
 
 
 def cmd_dash(args):
@@ -755,6 +851,14 @@ def cmd_dash(args):
         print(render_frame(tasks, events, path, args.feed))
         con.close()
         return
+    if is_tty:
+        try:
+            _curses_dash(snap, path, args)
+        except Exception:
+            pass  # curses unavailable/broken — fall back to the plain frame loop
+        else:
+            con.close()
+            return
     out = sys.stdout
     if is_tty:
         out.write("\033[?1049h\033[?25l")  # alternate screen, hide cursor
@@ -1007,18 +1111,30 @@ def remote_watch(args, url):
 def remote_dash(args, url):
     is_tty = sys.stdout.isatty()
     follow = args.follow or (is_tty and not args.once)
+
+    def snap():
+        s = _remote_get(url, f"/snapshot?feed={args.feed}", _passkey(args))
+        return s["tasks"], s["events"]
+
     if not follow:
-        snap = _remote_get(url, f"/snapshot?feed={args.feed}", _passkey(args))
-        print(render_frame(snap["tasks"], snap["events"], url, args.feed))
+        tasks, events = snap()
+        print(render_frame(tasks, events, url, args.feed))
         return
+    if is_tty:
+        try:
+            _curses_dash(snap, url, args)
+        except Exception:
+            pass  # curses unavailable/broken — fall back to the plain frame loop
+        else:
+            return
     out = sys.stdout
     if is_tty:
         out.write("\033[?1049h\033[?25l")
         out.flush()
     try:
         while True:
-            snap = _remote_get(url, f"/snapshot?feed={args.feed}", _passkey(args))
-            frame = render_frame(snap["tasks"], snap["events"], url, args.feed)
+            tasks, events = snap()
+            frame = render_frame(tasks, events, url, args.feed)
             if is_tty:
                 out.write("\033[H\033[2J" + frame + "\n")
             else:
