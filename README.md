@@ -181,4 +181,7 @@ expressed in `swrm` commands.
 ## Development
 
 Single file: `swrm` (Python 3 stdlib only). Schema: `tasks`, `links`
-(parent→child), `events` (append-only audit feed). Logo: `assets/logo.svg`.
+(parent→child), `events` (append-only audit feed). Brand assets in `assets/`:
+`logo.svg` (hive mark on dark tile, used above), `logo-mark.svg` (mark only,
+transparent), `logo-wordmark.svg` (mark + wordmark + tagline),
+`favicon.svg` / `favicon.ico` (16–256 px).
