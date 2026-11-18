@@ -721,23 +721,19 @@ def _fmt_remaining(expires_iso):
     return f"{m}m{s:02d}s" if m else f"{s}s"
 
 
-CARD_H = 3  # each board cell is a mini-card: title (up to 2 lines) + meta line
+CARD_H = 4  # each board cell is a bordered card: top border, title, meta, bottom border
 
 
 def _task_card(t, col_w):
-    """Render a task as a little card: human-readable title first (wrapped to the
-    column width, max 2 lines), then a dim meta line with id/priority/worker."""
-    wrapped = _wrap_lines(t["title"], col_w)[:2]
-    if len(_wrap_lines(t["title"], col_w)) > 2 and wrapped:
-        wrapped[-1] = _truncate(wrapped[-1], col_w)
-    while len(wrapped) < 2:
-        wrapped.append("")
+    """Content lines of a card (without the border): human-readable title first,
+    then a dim meta line with id/priority/worker."""
+    inner = col_w - 2
     meta = f"{t['id']} P{t['priority']}"
     if t["status"] == "doing" and t["claimed_by"]:
         meta += f" [{t['claimed_by']} {_fmt_remaining(t['claim_expires_at'])}]"
     elif t["assignee"]:
         meta += f" @{t['assignee']}"
-    return wrapped + [_truncate(meta, col_w)]
+    return [_truncate(t["title"], inner), _truncate(meta, inner)]
 
 
 def _board_columns(width):
@@ -791,8 +787,14 @@ def render_frame(tasks, events, title, feed_lines):
             for s in cols:
                 ts = col_tasks[s]
                 if i < len(ts):
-                    txt = _truncate(_task_card(ts[i], col_w)[li], col_w).ljust(col_w)
-                    cells.append(dim + txt + R if li == CARD_H - 1 else txt)
+                    card = _task_card(ts[i], col_w)
+                    if li == 0:
+                        cells.append(C[s] + "┌" + "─" * (col_w - 2) + "┐" + R)
+                    elif li == CARD_H - 1:
+                        cells.append(C[s] + "└" + "─" * (col_w - 2) + "┘" + R)
+                    else:
+                        txt = "│" + card[li - 1].ljust(col_w - 2) + "│"
+                        cells.append(dim + txt + R if li == CARD_H - 2 else txt)
                 else:
                     cells.append(" " * col_w)
             lines.append(" ".join(cells).rstrip())
@@ -952,12 +954,32 @@ def _curses_dash(snap, title, args, detail=None):
                     for ci, s in enumerate(cols):
                         ts = col_tasks[s]
                         j = offset + i
+                        y = top + i * CARD_H + li
+                        sel = ci == sel_col and j == sel_row and j < len(ts)
                         if j < len(ts):
-                            cell = _truncate(_task_card(ts[j], col_w)[li], col_w)
-                            attr = curses.A_REVERSE if (ci == sel_col and j == sel_row) else (curses.A_DIM if li == CARD_H - 1 else 0)
-                        else:
-                            cell, attr = "", 0
-                        stdscr.addnstr(top + i * CARD_H + li, x, cell, col_w, attr)
+                            card = _task_card(ts[j], col_w)
+                            if sel:
+                                attr = curses.A_REVERSE
+                            elif li in (0, CARD_H - 1):
+                                attr = attrs.get(s, 0)
+                            elif li == CARD_H - 2:
+                                attr = curses.A_DIM
+                            else:
+                                attr = 0
+                            if li == 0:
+                                stdscr.addch(y, x, curses.ACS_ULCORNER, attr)
+                                for k in range(1, col_w - 1):
+                                    stdscr.addch(y, x + k, curses.ACS_HLINE, attr)
+                                stdscr.addch(y, x + col_w - 1, curses.ACS_URCORNER, attr)
+                            elif li == CARD_H - 1:
+                                stdscr.addch(y, x, curses.ACS_LLCORNER, attr)
+                                for k in range(1, col_w - 1):
+                                    stdscr.addch(y, x + k, curses.ACS_HLINE, attr)
+                                stdscr.addch(y, x + col_w - 1, curses.ACS_LRCORNER, attr)
+                            else:
+                                stdscr.addch(y, x, curses.ACS_VLINE, attr)
+                                stdscr.addnstr(y, x + 1, card[li - 1], col_w - 2, attr)
+                                stdscr.addch(y, x + col_w - 1, curses.ACS_VLINE, attr)
                         x += col_w + 1
             stdscr.addnstr(bot, 0, "-" * (w - 1), w - 1)
             stdscr.addnstr(bot + 1, 0, " FEED (latest events)   [enter/click: card details · arrows/hjkl: move · q: quit]", w - 1)
