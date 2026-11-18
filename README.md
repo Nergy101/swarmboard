@@ -180,8 +180,11 @@ expressed in `swrm` commands.
 
 ## Docs
 
-A static docs site lives in `docs/` (MkDocs + Material). Serve the built HTML
-in `docs/site/` with any static file server:
+Docs live at **[nergy101.github.io/swarmboard](https://nergy101.github.io/swarmboard/)** —
+deployed automatically to GitHub Pages by `.github/workflows/docs.yml` on every
+push to `main` that touches `docs/`. Sources are the Markdown files in `docs/src/`
+(MkDocs + Material); the built static HTML is in `docs/site/` and can also be
+served locally with any static file server:
 
 ```bash
 python3 -m http.server -d docs/site 8000     # or rebuild: python3 -m mkdocs build

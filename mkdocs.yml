@@ -1,5 +1,6 @@
 site_name: swarmboard
 site_description: One board. The whole swarm. A CLI-first kanban board (swrm) for multi-agent swarms.
+site_url: https://nergy101.github.io/swarmboard/
 docs_dir: docs/src
 site_dir: docs/site
 
