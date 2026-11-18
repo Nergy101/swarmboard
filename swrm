@@ -847,37 +847,42 @@ def _modal_lines(t, det):
     return lines
 
 
-def _show_modal(stdscr, t, det, attrs):
-    """Centered detail popup; up/down scroll, q/Esc/Enter closes."""
+def _box(win, y, x, h, w, attr=0):
+    """Draw a bordered box on a curses window using ACS line chars."""
+    import curses
+    win.addch(y, x, curses.ACS_ULCORNER, attr)
+    win.addch(y, x + w - 1, curses.ACS_URCORNER, attr)
+    win.addch(y + h - 1, x, curses.ACS_LLCORNER, attr)
+    win.addch(y + h - 1, x + w - 1, curses.ACS_LRCORNER, attr)
+    for k in range(1, w - 1):
+        win.addch(y, x + k, curses.ACS_HLINE, attr)
+        win.addch(y + h - 1, x + k, curses.ACS_HLINE, attr)
+    for k in range(1, h - 1):
+        win.addch(y + k, x, curses.ACS_VLINE, attr)
+        win.addch(y + k, x + w - 1, curses.ACS_VLINE, attr)
+
+
+def _draw_modal(stdscr, t, det, attrs, off):
+    """Draw the centered detail popup directly on stdscr (no subwindow — a
+    subwindow's refresh makes curses.getmouse() fail with ERR). The main loop
+    redraws the whole board each frame anyway. Returns (scroll offset, rect)."""
     import curses
     h, w = stdscr.getmaxyx()
     content = _modal_lines(t, det)
     mw = min(76, max(44, w - 4))
     mh = max(8, min(h - 2, len(content) + 4))
-    win = curses.newwin(mh, mw, (h - mh) // 2, (w - mw) // 2)
-    win.keypad(True)
-    off = 0
-    while True:
-        maxvis = mh - 3
-        win.erase()
-        win.border()
-        win.addnstr(0, 2, f" {t['id']} ", mw - 4, attrs.get(t["status"], 0) | curses.A_BOLD)
-        for i in range(maxvis):
-            if off + i < len(content):
-                win.addnstr(1 + i, 2, content[off + i][: mw - 4], mw - 4)
-        if len(content) > maxvis:
-            win.addnstr(mh - 1, 2, f" {off + 1}-{min(off + maxvis, len(content))}/{len(content)}  up/down scroll, q close ", mw - 4, curses.A_DIM)
-        win.refresh()
-        ch = win.getch()
-        if ch in (ord("q"), 27, 10, 13, curses.KEY_ENTER):
-            break
-        if ch in (curses.KEY_UP, ord("k")):
-            off = max(0, off - 1)
-        elif ch in (curses.KEY_DOWN, ord("j")):
-            off = min(max(0, len(content) - maxvis), off + 1)
-    del win
-    stdscr.touchwin()
-    stdscr.refresh()
+    win_y, win_x = (h - mh) // 2, (w - mw) // 2
+    maxvis = mh - 3
+    off = min(off, max(0, len(content) - maxvis))
+    _box(stdscr, win_y, win_x, mh, mw, attrs.get(t["status"], 0))
+    stdscr.addnstr(win_y, win_x + 2, f" {t['id']} ", mw - 4, attrs.get(t["status"], 0) | curses.A_BOLD)
+    for i in range(maxvis):
+        if off + i < len(content):
+            stdscr.addnstr(win_y + 1 + i, win_x + 2, content[off + i][: mw - 4], mw - 4)
+    if len(content) > maxvis:
+        stdscr.addnstr(win_y + mh - 1, win_x + 2,
+                       f" {off + 1}-{min(off + maxvis, len(content))}/{len(content)}  up/down scroll, q close ", mw - 4, curses.A_DIM)
+    return off, (win_x, win_y, mw, mh)
 
 
 def _curses_dash(snap, title, args, detail=None):
@@ -907,6 +912,9 @@ def _curses_dash(snap, title, args, detail=None):
         sel_col = 0
         sel_row = 0
         offset = 0
+        modal = None   # {"t": task, "det": detail-dict} while a card popup is open
+        moff = 0       # popup scroll offset
+        mrect = None   # popup rect (x, y, w, h)
         while True:
             tasks, events = snap()
             h, w = stdscr.getmaxyx()
@@ -928,9 +936,24 @@ def _curses_dash(snap, title, args, detail=None):
             if sel_row >= offset + slots:
                 offset = sel_row - slots + 1
 
+            def pick(mx, my):
+                """Map a screen click to a card, or None."""
+                if top <= my < bot:
+                    ci = min(len(cols) - 1, mx // (col_w + 1))
+                    r = offset + (my - top) // CARD_H
+                    ts = col_tasks[cols[ci]]
+                    if r < len(ts):
+                        return ts[r]
+                return None
+
             def open_modal(t):
-                det = detail(t["id"]) if detail else None
-                _show_modal(stdscr, t, det, attrs)
+                nonlocal modal, moff
+                modal = {"t": t, "det": detail(t["id"]) if detail else None}
+                moff = 0
+
+            def close_modal():
+                nonlocal modal
+                modal = None
 
             stdscr.erase()
             stdscr.addnstr(0, 0, _truncate(f" KANBAN {title}   {now_iso()}", w), w - 1)
@@ -982,14 +1005,45 @@ def _curses_dash(snap, title, args, detail=None):
                                 stdscr.addch(y, x + col_w - 1, curses.ACS_VLINE, attr)
                         x += col_w + 1
             stdscr.addnstr(bot, 0, "-" * (w - 1), w - 1)
-            stdscr.addnstr(bot + 1, 0, " FEED (latest events)   [enter/click: card details · arrows/hjkl: move · q: quit]", w - 1)
+            stdscr.addnstr(bot + 1, 0, " FEED (latest events)   [enter/click: card details · click another card: switch · arrows/hjkl: move · q: quit]", w - 1)
             for i, e in enumerate(events[:feed_n]):
                 ts = e["ts"][11:19] if len(e["ts"]) >= 19 else e["ts"]
                 line = f"#{e['id']} {ts} {e['actor']} {e['action']} {e['task_id'] or '-'} {e['details']}"
                 stdscr.addnstr(bot + 2 + i, 0, _truncate(line, w - 1), w - 1)
+            if modal is not None:
+                moff, mrect = _draw_modal(stdscr, modal["t"], modal["det"], attrs, moff)
             stdscr.refresh()
 
             ch = stdscr.getch()
+            if modal is not None:
+                # popup open: q/Esc/Enter closes, up/down scroll it, a click
+                # outside it closes it — or switches to the clicked card
+                if ch in (ord("q"), 27, 10, 13, curses.KEY_ENTER):
+                    close_modal()
+                elif ch in (curses.KEY_UP, ord("k")):
+                    moff = max(0, moff - 1)
+                elif ch in (curses.KEY_DOWN, ord("j")):
+                    moff += 1
+                elif ch == curses.KEY_MOUSE and mrect:
+                    try:
+                        _, mx, my, _, bstate = curses.getmouse()
+                    except curses.error:
+                        continue
+                    if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                        wx, wy, ww, wh = mrect
+                        if wx <= mx < wx + ww and wy <= my < wy + wh:
+                            pass  # click inside the popup: ignore
+                        else:
+                            t = pick(mx, my)
+                            if t is not None:
+                                sel_col = min(len(cols) - 1, mx // (col_w + 1))
+                                sel_row = offset + (my - top) // CARD_H
+                                open_modal(t)   # switch the popup to the clicked card
+                            else:
+                                close_modal()    # clicked outside any card: close
+                elif ch == curses.KEY_RESIZE:
+                    pass
+                continue
             if ch in (ord("q"), 3):  # q or Ctrl-C
                 break
             if ch in (curses.KEY_UP, ord("k")):
@@ -1009,13 +1063,12 @@ def _curses_dash(snap, title, args, detail=None):
                     _, mx, my, _, bstate = curses.getmouse()
                 except curses.error:
                     continue
-                if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED) and top <= my < bot:
-                    ci = min(len(cols) - 1, mx // (col_w + 1))
-                    r = offset + (my - top) // CARD_H
-                    ts = col_tasks[cols[ci]]
-                    if r < len(ts):
-                        sel_col, sel_row = ci, r
-                        open_modal(ts[r])
+                if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                    t = pick(mx, my)
+                    if t is not None:
+                        sel_col = min(len(cols) - 1, mx // (col_w + 1))
+                        sel_row = offset + (my - top) // CARD_H
+                        open_modal(t)
             elif ch == curses.KEY_RESIZE:
                 pass  # redrawn on next loop iteration
 
