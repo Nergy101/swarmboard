@@ -178,6 +178,15 @@ swarm through this board (load it as `/swarmboard`; adapted from the
 anti-temptation rules ("route, don't execute"), and stuck-card recovery — all
 expressed in `swrm` commands.
 
+## Docs
+
+A static docs site lives in `docs/` (MkDocs + Material). Serve the built HTML
+in `docs/site/` with any static file server:
+
+```bash
+python3 -m http.server -d docs/site 8000     # or rebuild: python3 -m mkdocs build
+```
+
 ## Development
 
 Single file: `swrm` (Python 3 stdlib only). Schema: `tasks`, `links`

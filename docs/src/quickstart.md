@@ -1,0 +1,42 @@
+# Quickstart
+
+```bash
+swrm init                                   # create the board
+swrm add "research costs" --assignee researcher
+swrm add "ship it" --parent t_aa11          # starts in todo until parent is done
+swrm claim --any --assignee researcher --actor researcher
+swrm comment t_aa11 "started" --actor researcher
+swrm complete t_aa11 --actor researcher --summary "costs done"
+swrm dash                                   # live board
+```
+
+## Watch it live
+
+```bash
+swrm dash          # full-screen live board, re-rendered every 0.5s (alias: swrm dashboard)
+```
+
+```
+ KANBAN /proj/.kanban/kanban.db   2026-11-17T23:21:40Z
+todo:1  ready:2  doing:1  blocked:0  done:12
+----------------------------------------------------------------
+TODO (1)        READY (2)       DOING (1)       BLOCKED (0)  DONE (12)
+--------------  --------------  --------------  -----------  ------
+t_aa11 P1 @dev  t_bb22 P3 @qa   t_9f4b P0 [dev 14m59s] polish dashboard
+ feed: #41 dev claimed t_9f4b ...  #42 qa done t_cc33 ...
+```
+
+`doing` rows show **which worker picked up which task** and the time left on
+their claim. Ctrl-C to stop. `swrm dash --once` prints one snapshot (default
+when piped); `swrm watch --json` is the NDJSON feed for piping into other
+agents.
+
+## Lifecycle
+
+```
+todo ──(all parents done)──> ready ──(claim)──> doing ──> done
+                                            └───────> blocked ──(unblock)──> ready
+```
+
+Claims expire (default TTL 900 s, `--ttl` to change); `swrm reclaim` releases
+stale ones back to `ready`.
