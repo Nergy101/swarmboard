@@ -743,8 +743,12 @@
 <td>add a note to the card's history</td>
 </tr>
 <tr>
-<td><code>swrm rm &lt;id&gt;</code></td>
-<td>archive</td>
+<td><code>swrm rm &lt;id&gt;</code> / <code>swrm rm &lt;status&gt;</code> / <code>swrm rm --all</code></td>
+<td>archive one card, all cards in a status (<code>rm done</code>, <code>rm blocked</code>), or the whole board</td>
+</tr>
+<tr>
+<td><code>swrm prune [--dry-run]</code></td>
+<td>permanently delete archived cards, their links and their events</td>
 </tr>
 <tr>
 <td><code>swrm events [--task ID] [--limit N]</code></td>

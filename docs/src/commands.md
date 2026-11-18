@@ -18,7 +18,8 @@
 | `swrm edit <id> [--title T] [--body B] [--priority N] [--label L]...` | edit fields |
 | `swrm link <parent> <child>` / `swrm unlink <parent> <child>` | dependency links; linking demotes a runnable child to `todo` until parents finish |
 | `swrm comment <id> "text"` | add a note to the card's history |
-| `swrm rm <id>` | archive |
+| `swrm rm <id>` / `swrm rm <status>` / `swrm rm --all` | archive one card, all cards in a status (`rm done`, `rm blocked`), or the whole board |
+| `swrm prune [--dry-run]` | permanently delete archived cards, their links and their events |
 | `swrm events [--task ID] [--limit N]` | dump the change feed |
 | `swrm watch [--json] [--since N] [--interval S]` | stream the change feed live (Ctrl-C to stop) |
 | `swrm serve [--host H] [--port P] [--passkey K]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL`; `--passkey` requires followers to authenticate |

@@ -584,19 +584,64 @@ def cmd_comment(args):
 
 
 def cmd_rm(args):
+    if args.all and args.id:
+        die("use either an id/status or --all, not both", 2)
+    if not args.all and not args.id:
+        die("rm needs a task id, a status name (e.g. 'swrm rm done'), or --all", 2)
+    if args.id in STATUSES and args.id == "archived":
+        die("archived cards are already hidden from the board; use 'swrm prune' to delete them", 2)
+
     con = connect(resolve_db(args))
     actor = resolve_actor(args)
     con.execute("BEGIN IMMEDIATE")
     try:
-        t = get_task(con, args.id)
-        con.execute("UPDATE tasks SET status='archived', updated_at=? WHERE id=?", (now_iso(), args.id))
-        emit(con, actor, "archived", args.id, prev=t["status"])
+        if args.all:
+            rows = con.execute("SELECT * FROM tasks WHERE status != 'archived'").fetchall()
+            target = "all"
+        elif args.id in STATUSES:
+            rows = con.execute("SELECT * FROM tasks WHERE status=?", (args.id,)).fetchall()
+            target = args.id
+        else:
+            rows = [get_task(con, args.id)]
+            target = args.id
+        ids = []
+        for t in rows:
+            con.execute("UPDATE tasks SET status='archived', updated_at=? WHERE id=?", (now_iso(), t["id"]))
+            emit(con, actor, "archived", t["id"], prev=t["status"])
+            ids.append(t["id"])
         con.execute("COMMIT")
     except Exception:
         con.execute("ROLLBACK")
         raise
     con.close()
-    out(args, f"archived {args.id}", {"id": args.id})
+    if len(ids) == 1 and target == ids[0]:
+        out(args, f"archived {ids[0]}", {"id": ids[0]})
+    else:
+        out(args, f"archived {len(ids)} cards ({target})", {"archived": ids, "count": len(ids)})
+
+
+def cmd_prune(args):
+    """Permanently delete archived cards, their links, and their events."""
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        ids = [r["id"] for r in con.execute("SELECT id FROM tasks WHERE status='archived'").fetchall()]
+        if args.dry_run:
+            con.execute("ROLLBACK")
+        else:
+            for tid in ids:
+                con.execute("DELETE FROM links WHERE parent_id=? OR child_id=?", (tid, tid))
+                con.execute("DELETE FROM events WHERE task_id=?", (tid,))
+                con.execute("DELETE FROM tasks WHERE id=?", (tid,))
+            emit(con, actor, "pruned", None, count=len(ids), ids=ids)
+            con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    con.close()
+    verb = "would prune" if args.dry_run else "pruned"
+    out(args, f"{verb} {len(ids)} archived cards", {"count": len(ids), "ids": ids, "dry_run": args.dry_run})
 
 
 def cmd_events(args):
@@ -1253,9 +1298,14 @@ def build_parser():
     cm.add_argument("text")
     cm.set_defaults(func=cmd_comment)
 
-    rm = sub.add_parser("rm", parents=[common], help="archive a task")
-    rm.add_argument("id")
+    rm = sub.add_parser("rm", parents=[common], help="archive a task, a whole status ('rm done'), or everything ('rm --all')")
+    rm.add_argument("id", nargs="?", help="task id, or a status name (todo/ready/doing/done/blocked) to archive all cards in it")
+    rm.add_argument("--all", action="store_true", help="archive all non-archived cards")
     rm.set_defaults(func=cmd_rm)
+
+    pr = sub.add_parser("prune", parents=[common], help="permanently delete archived cards, their links and their events")
+    pr.add_argument("--dry-run", action="store_true", help="show what would be deleted without deleting")
+    pr.set_defaults(func=cmd_prune)
 
     ev = sub.add_parser("events", parents=[common], help="dump the change feed")
     ev.add_argument("--task", help="only events for this task")
