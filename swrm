@@ -1001,7 +1001,9 @@ def _curses_dash(snap, title, args, detail=None):
                                 stdscr.addch(y, x + col_w - 1, curses.ACS_LRCORNER, attr)
                             else:
                                 stdscr.addch(y, x, curses.ACS_VLINE, attr)
-                                stdscr.addnstr(y, x + 1, card[li - 1], col_w - 2, attr)
+                                # ljust so the padding cells get the attr too — otherwise
+                                # a selected card shows a black hole where there's no text
+                                stdscr.addnstr(y, x + 1, card[li - 1].ljust(col_w - 2), col_w - 2, attr)
                                 stdscr.addch(y, x + col_w - 1, curses.ACS_VLINE, attr)
                         x += col_w + 1
             stdscr.addnstr(bot, 0, "-" * (w - 1), w - 1)
