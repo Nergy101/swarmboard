@@ -90,12 +90,76 @@ def now_iso():
 
 
 def resolve_db(args):
-    path = args.db or os.environ.get("KANBAN_DB") or os.path.join(".kanban", "kanban.db")
-    return os.path.abspath(path)
+    """Resolution order: --db > -b/--board > $KANBAN_DB > ./.kanban/kanban.db (if it
+    exists) > the active board from the registry; final fallback is the cwd default."""
+    if getattr(args, "db", None):
+        return os.path.abspath(args.db)
+    board = getattr(args, "board", None)
+    if board:
+        reg = load_registry()
+        if board not in reg["boards"]:
+            die(f"unknown board: {board}; add it with `swrm boards add {board} <path>`", 2)
+        return os.path.abspath(reg["boards"][board])
+    envdb = os.environ.get("KANBAN_DB")
+    if envdb:
+        return os.path.abspath(envdb)
+    cwd_default = os.path.abspath(os.path.join(".kanban", "kanban.db"))
+    if os.path.exists(cwd_default):
+        return cwd_default
+    reg = load_registry()
+    if reg["active"]:
+        return os.path.abspath(reg["boards"][reg["active"]])
+    return cwd_default
+
+
+def board_label(args):
+    """Human-friendly board identity for titles: explicit flag, else the same
+    rule as resolve_db (name for registry boards, path otherwise)."""
+    board = getattr(args, "board", None)
+    if board:
+        return board
+    if getattr(args, "db", None) or os.environ.get("KANBAN_DB"):
+        return resolve_db(args)
+    reg = load_registry()
+    cwd_default = os.path.abspath(os.path.join(".kanban", "kanban.db"))
+    if os.path.exists(cwd_default):
+        return cwd_default
+    if reg["active"]:
+        return reg["active"]
+    return cwd_default
 
 
 def resolve_actor(args):
     return args.actor or os.environ.get("KANBAN_ACTOR") or os.environ.get("USER") or "unknown"
+
+
+def swrm_home():
+    """Directory holding the board registry (override with $SWRM_HOME, mainly for tests)."""
+    return os.environ.get("SWRM_HOME") or os.path.expanduser("~/.swarmboard")
+
+
+def registry_path():
+    return os.path.join(swrm_home(), "boards.json")
+
+
+def load_registry():
+    try:
+        with open(registry_path()) as f:
+            reg = json.load(f)
+        if not isinstance(reg, dict) or not isinstance(reg.get("boards"), dict):
+            raise ValueError("bad registry")
+    except Exception:
+        return {"active": None, "boards": {}}
+    reg.setdefault("active", None)
+    reg.setdefault("boards", {})
+    return reg
+
+
+def save_registry(reg):
+    d = swrm_home()
+    os.makedirs(d, exist_ok=True)
+    with open(registry_path(), "w") as f:
+        json.dump(reg, f, indent=2)
 
 
 def connect(path, create=True):
@@ -210,6 +274,75 @@ def cmd_init(args):
     con = connect(path)
     con.close()
     out(args, f"initialized board at {path}", {"db": path})
+
+
+def cmd_boards(args):
+    """`swrm boards` lists the registry; add/rename/rm manage it (databases are
+    never created or deleted by the registry, only referenced)."""
+    reg = load_registry()
+    action = args.action
+    if action in (None, "ls", "list"):
+        rows = [{"name": n, "path": p, "active": n == reg["active"]}
+                for n, p in sorted(reg["boards"].items())]
+        if args.json:
+            out(args, "", {"active": reg["active"], "boards": rows})
+            return
+        if not rows:
+            print("(no registered boards; add one with `swrm boards add <naam> <pad>`)")
+            return
+        for r in rows:
+            mark = "->" if r["active"] else "  "
+            print(f"{mark} {r['name']:<24} {r['path']}")
+        return
+    if action == "add":
+        if not args.name or not args.path_or_new:
+            die("usage: swrm boards add <naam> <pad/naar/board.db>", 2)
+        if args.name in reg["boards"]:
+            die(f"board name taken: {args.name}", 1)
+        path = os.path.abspath(args.path_or_new)
+        reg["boards"][args.name] = path
+        save_registry(reg)
+        out(args, f"registered board '{args.name}' -> {path}",
+            {"name": args.name, "path": path})
+        return
+    if action == "rename":
+        if not args.name or not args.path_or_new:
+            die("usage: swrm boards rename <oud> <nieuw>", 2)
+        if args.name not in reg["boards"]:
+            die(f"unknown board: {args.name}", 1)
+        if args.path_or_new in reg["boards"]:
+            die(f"board name taken: {args.path_or_new}", 1)
+        reg["boards"][args.path_or_new] = reg["boards"].pop(args.name)
+        if reg["active"] == args.name:
+            reg["active"] = args.path_or_new
+        save_registry(reg)
+        out(args, f"renamed board '{args.name}' -> '{args.path_or_new}'",
+            {"name": args.path_or_new, "previous": args.name,
+             "path": reg["boards"][args.path_or_new]})
+        return
+    if action == "rm":
+        if not args.name:
+            die("usage: swrm boards rm <naam>", 2)
+        if args.name not in reg["boards"]:
+            die(f"unknown board: {args.name}", 1)
+        del reg["boards"][args.name]
+        if reg["active"] == args.name:
+            reg["active"] = None
+        save_registry(reg)
+        out(args, f"unregistered board '{args.name}' (database left untouched)",
+            {"removed": args.name})
+
+
+def cmd_switch(args):
+    reg = load_registry()
+    if args.name not in reg["boards"]:
+        known = ", ".join(sorted(reg["boards"])) or "(none)"
+        die(f"unknown board: {args.name}; known boards: {known}", 1)
+    reg["active"] = args.name
+    save_registry(reg)
+    path = os.path.abspath(reg["boards"][args.name])
+    out(args, f"switched to board '{args.name}' ({path})",
+        {"active": args.name, "path": path})
 
 
 def cmd_add(args):
@@ -829,7 +962,7 @@ def cmd_watch(args):
             "SELECT id FROM tasks WHERE status != 'archived' AND " + " AND ".join(conds), params).fetchall()}
     if not args.json:
         flt = f" (filtered: {', '.join(labels)})" if labels else ""
-        print(f"watching {resolve_db(args)} (feed from event #{last + 1}){flt}; Ctrl-C to stop", file=sys.stderr)
+        print(f"watching {board_label(args)} (feed from event #{last + 1}){flt}; Ctrl-C to stop", file=sys.stderr)
     try:
         while True:
             rows = con.execute(
@@ -1243,6 +1376,7 @@ def _curses_dash(snap, title, args, detail=None):
 
 def cmd_dash(args):
     path = resolve_db(args)
+    title = board_label(args)
     con = connect(path)
     labels = args.label or []
 
@@ -1277,7 +1411,7 @@ def cmd_dash(args):
     follow = args.follow or (is_tty and not args.once)
     if not follow:
         tasks, events = snap()
-        print(render_frame(tasks, events, path, args.feed, colors()))
+        print(render_frame(tasks, events, title, args.feed, colors()))
         con.close()
         return
     if is_tty:
@@ -1295,7 +1429,7 @@ def cmd_dash(args):
     try:
         while True:
             tasks, events = snap()
-            frame = render_frame(tasks, events, path, args.feed, colors())
+            frame = render_frame(tasks, events, title, args.feed, colors())
             if is_tty:
                 out.write("\033[H\033[2J" + frame + "\n")
             else:
@@ -1462,7 +1596,8 @@ def cmd_serve(args):
     KanbanHandler.db_path = path
     KanbanHandler.passkey = args.passkey or os.environ.get("KANBAN_PASSKEY") or None
     srv = ThreadingHTTPServer((args.host, args.port), KanbanHandler)
-    print(f"swarmboard leader serving {path}")
+    board = f" (board '{args.board}')" if getattr(args, "board", None) else ""
+    print(f"swarmboard leader serving {path}{board}")
     print(f"  http://{args.host}:{args.port}  (Ctrl-C to stop)")
     print(f"  passkey: {'set' if KanbanHandler.passkey else 'NOT set (open API, trusted networks only)'}")
     print(f"followers: export KANBAN_URL=http://<this-host>:{args.port}" +
@@ -1605,6 +1740,7 @@ def remote_dash(args, url):
 def build_parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", help="path to board database (default: $KANBAN_DB or ./.kanban/kanban.db)")
+    common.add_argument("-b", "--board", help="board name from the registry (~/.swarmboard/boards.json); see `swrm boards`")
     common.add_argument("--actor", help="actor name recorded in the feed (default: $KANBAN_ACTOR or $USER)")
     common.add_argument("--json", action="store_true", help="machine-readable JSON output")
     common.add_argument("--url", help="leader URL (default: $KANBAN_URL); when set, commands run remotely over HTTP")
@@ -1617,6 +1753,18 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init", parents=[common], help="create the board database").set_defaults(func=cmd_init)
+
+    bo = sub.add_parser("boards", parents=[common],
+                        help="list registered boards, or add/rename/rm entries")
+    bo.add_argument("action", nargs="?", choices=["add", "rename", "rm", "ls", "list"],
+                    help="omit (or 'ls') to list all registered boards")
+    bo.add_argument("name", nargs="?", help="board name")
+    bo.add_argument("path_or_new", nargs="?", help="board db path (add), or new name (rename)")
+    bo.set_defaults(func=cmd_boards)
+
+    swp = sub.add_parser("switch", parents=[common], help="make a registered board the active one")
+    swp.add_argument("name", help="board name from the registry")
+    swp.set_defaults(func=cmd_switch)
 
     a = sub.add_parser("add", parents=[common], help="create a task")
     a.add_argument("title")
