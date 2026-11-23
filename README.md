@@ -33,19 +33,26 @@ concurrently — and everyone sees it happen immediately.
   in the same transaction. `swrm watch` streams it; `swrm dash` renders it.
 - **Terminal-first** — the board *is* the terminal. Open `swrm dash` and watch
   the swarm move.
-- **Zero dependencies** — a single Python 3 file (`swrm`) using only the standard library.
+- **Zero dependencies** — a single Python 3 module (`swrm.py`) using only the standard library.
 
 ## Install
 
 ```bash
+pipx install swarmboard    # command: swrm
+```
+
+or with Homebrew: `brew tap Nergy101/swrm && brew install swrm`, or from source:
+
+```bash
 git clone https://github.com/Nergy101/swarmboard.git
 cd swarmboard
-chmod +x swrm                   # already executable
+chmod +x swrm                   # already executable (two-line shim around swrm.py)
 ln -s "$PWD/swrm" ~/.local/bin/swrm   # optional: put it on PATH
 swrm init                       # create ./.kanban/kanban.db
 ```
 
-Requires Python 3.8+. Board location: `--db PATH`, else `$KANBAN_DB`, else
+Requires Python 3.9+. `swrm update` self-updates pipx/Homebrew/git installs.
+Board location: `--db PATH`, else `$KANBAN_DB`, else
 `./.kanban/kanban.db`. Actor name: `--actor NAME`, else `$KANBAN_ACTOR`, else
 `$USER`. Every command also accepts `--json`. Remote mode: set `$KANBAN_URL`
 (or pass `--url`) and every command runs against the leader over HTTP — see
