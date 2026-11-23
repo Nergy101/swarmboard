@@ -43,6 +43,24 @@ LABEL_COLORS = {
     "default": "",
 }
 
+# ------------------------------------------------------------------ connectors
+# Default board -> Linear status mapping (override per connector with
+# `swrm connector add linear --map <boardstatus>=<linear state>`).
+DEFAULT_STATUS_MAP = {
+    "todo": "Todo",
+    "ready": "Todo",
+    "doing": "In Progress",
+    "blocked": "In Review",
+    "done": "Done",
+}
+CONNECTOR_TYPES = ["linear"]
+CONNECTOR_ACTOR_PREFIX = "connector:"
+DEFAULT_LINEAR_API = "https://api.linear.app/graphql"
+EPOCH_ISO = "1970-01-01T00:00:00.000Z"
+# Events that trigger a push (status changes use the status name as action).
+PUSH_ACTIONS = {"created", "edited", "assigned"} | {s for s in ACTIVE_STATUSES} | {"done"}
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id               TEXT PRIMARY KEY,
@@ -57,7 +75,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at       TEXT NOT NULL,
     claimed_by       TEXT NOT NULL DEFAULT '',
     claimed_at       TEXT NOT NULL DEFAULT '',
-    claim_expires_at TEXT NOT NULL DEFAULT ''
+    claim_expires_at TEXT NOT NULL DEFAULT '',
+    external_ref     TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS links (
     parent_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -75,6 +94,12 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS label_colors (
     name  TEXT PRIMARY KEY,
     color TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS connector_state (
+    connector TEXT NOT NULL,
+    key       TEXT NOT NULL,
+    value     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (connector, key)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
@@ -162,6 +187,337 @@ def save_registry(reg):
         json.dump(reg, f, indent=2)
 
 
+# ------------------------------------------------------------- connectors (NER-331)
+
+
+class ConnectorError(Exception):
+    pass
+
+
+def connectors_paths(args):
+    """(config, secrets) paths, both next to the resolved board database.
+    Tokens live in connectors.secrets.json (mode 600), never in the board db."""
+    d = os.path.dirname(os.path.abspath(resolve_db(args)))
+    return (os.path.join(d, "connectors.json"),
+            os.path.join(d, "connectors.secrets.json"))
+
+
+def load_connectors(args):
+    path, _ = connectors_paths(args)
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+        if not isinstance(doc, dict) or not isinstance(doc.get("connectors"), dict):
+            raise ValueError("bad connectors config")
+        return doc
+    except FileNotFoundError:
+        return {"connectors": {}}
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        die(f"cannot read {path}: {e}", 1)
+
+
+def save_connectors(args, doc):
+    path, _ = connectors_paths(args)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2)
+    try:
+        os.chmod(path, 0o644)
+    except OSError:
+        pass
+
+
+def load_secrets(args):
+    _, path = connectors_paths(args)
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+        return doc if isinstance(doc, dict) else {}
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def save_secret(args, name, token):
+    _, path = connectors_paths(args)
+    secrets = load_secrets(args)
+    secrets[name] = {"token": token}
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(secrets, f, indent=2)
+    os.chmod(path, 0o600)
+
+
+def resolve_connector_token(args, name, ctype):
+    env = {"linear": "SWRM_LINEAR_TOKEN"}.get(ctype)
+    sec = load_secrets(args).get(name, {})
+    token = sec.get("token") or (os.environ.get(env) if env else None)
+    if not token:
+        hint = f" or set ${env}" if env else ""
+        die(f"connector '{name}' has no token; run `swrm connector auth {name} --token <token>`{hint}", 2)
+    return token
+
+
+def get_state(con, connector, key, default=None):
+    r = con.execute("SELECT value FROM connector_state WHERE connector=? AND key=?",
+                    (connector, key)).fetchone()
+    return r["value"] if r else default
+
+
+def set_state(con, connector, key, value):
+    con.execute("INSERT INTO connector_state (connector, key, value) VALUES (?,?,?) "
+                "ON CONFLICT(connector, key) DO UPDATE SET value=excluded.value",
+                (connector, key, str(value)))
+
+
+def _linear_gql(cfg, token, query, variables=None, _attempt=0):
+    """One Linear GraphQL call (stdlib urllib); exponential backoff on
+    429/5xx/network errors, honoring Retry-After."""
+    api = cfg.get("api_base") or DEFAULT_LINEAR_API
+    payload = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = urllib.request.Request(api, data=payload, method="POST")
+    req.add_header("Authorization", token)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = json.loads(r.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        if e.code in (429, 500, 502, 503) and _attempt < 3:
+            try:
+                wait = float(e.headers.get("Retry-After"))
+            except (TypeError, ValueError):
+                wait = 0.5 * (2 ** _attempt)
+            time.sleep(min(wait, 30.0))
+            return _linear_gql(cfg, token, query, variables, _attempt + 1)
+        raise ConnectorError(f"Linear API HTTP {e.code}: {e.read().decode(errors='replace')[:300]}") from e
+    except urllib.error.URLError as e:
+        if _attempt < 3:
+            time.sleep(min(0.5 * (2 ** _attempt), 30.0))
+            return _linear_gql(cfg, token, query, variables, _attempt + 1)
+        raise ConnectorError(f"Linear API unreachable: {e}") from e
+    if body.get("errors"):
+        msgs = "; ".join(str(e.get("message")) for e in body["errors"])
+        raise ConnectorError(f"Linear API error: {msgs[:400]}")
+    return body.get("data") or {}
+
+
+def _linear_team_id(cfg, token):
+    value = cfg.get("team")
+    if not value:
+        return None
+    data = _linear_gql(cfg, token, "query { teams(first: 100) { nodes { id key name } } }")
+    nodes = ((data.get("teams") or {}).get("nodes")) or []
+    for n in nodes:
+        if value in (n.get("id"), n.get("key"), n.get("name")):
+            return n["id"]
+    known = ", ".join(sorted(str(n.get("key")) for n in nodes))
+    raise ConnectorError(f"no Linear team matches {value!r} (known teams: {known})")
+
+
+def _linear_project_id(cfg, token):
+    value = cfg.get("project")
+    if not value:
+        return None
+    data = _linear_gql(cfg, token, "query { projects(first: 100) { nodes { id name } } }")
+    nodes = ((data.get("projects") or {}).get("nodes")) or []
+    for n in nodes:
+        if value in (n.get("id"), n.get("name")):
+            return n["id"]
+    raise ConnectorError(f"no Linear project matches {value!r}")
+
+
+def _linear_states(cfg, token, team_id):
+    if not team_id:
+        return {}
+    data = _linear_gql(cfg, token,
+                      "query($id: String!) { team(id: $id) { states { nodes { id name } } } }",
+                      {"id": team_id})
+    nodes = (((data.get("team") or {}).get("states")) or {}).get("nodes") or []
+    return {n["name"]: n["id"] for n in nodes}
+
+
+def _reverse_status_map(status_map):
+    rev = {}
+    for local, external in status_map.items():
+        rev.setdefault(external, local)
+    return rev
+
+
+def _linear_push_task(con, name, cfg, token, task, states, team_id, project_id):
+    """Mirror the CURRENT task state to Linear (idempotent). Creates the issue
+    when the task has no external_ref yet."""
+    ref = task["external_ref"]
+    if ref:
+        inp = {"title": task["title"], "description": task["body"]}
+        state_id = states.get(cfg["status_map"].get(task["status"]))
+        if state_id:
+            inp["stateId"] = state_id
+        data = _linear_gql(cfg, token,
+                           "mutation($id: String!, $input: IssueUpdateInput!) "
+                           "{ issueUpdate(id: $id, input: $input) { success issue { id } } }",
+                           {"id": ref, "input": inp})
+        ok = (data.get("issueUpdate") or {}).get("success")
+        if not ok:
+            raise ConnectorError(f"issueUpdate failed for {ref}")
+        return "updated"
+    if not team_id:
+        raise ConnectorError("task without external_ref: creating Linear issues needs a team "
+                             "(`swrm connector add ... --key team=<key|naam|id>`)")
+    inp = {"teamId": team_id, "title": task["title"], "description": task["body"]}
+    if project_id:
+        inp["projectId"] = project_id
+    data = _linear_gql(cfg, token,
+                       "mutation($input: IssueCreateInput!) "
+                       "{ issueCreate(input: $input) { success issue { id identifier } } }",
+                       {"input": inp})
+    payload = data.get("issueCreate") or {}
+    issue = payload.get("issue") or {}
+    if not payload.get("success") or not issue.get("id"):
+        raise ConnectorError("issueCreate failed")
+    con.execute("UPDATE tasks SET external_ref=? WHERE id=?", (issue["id"], task["id"]))
+    emit(con, CONNECTOR_ACTOR_PREFIX + name, "external-linked", task["id"],
+         ref=issue["id"], identifier=issue.get("identifier", ""))
+    return "created"
+
+
+def _linear_pull(con, name, cfg, token, states, team_id, project_id, full=False):
+    """Apply Linear issues changed since the pull cursor to the board.
+    Last-write-wins with a per-issue marker so one change syncs exactly once."""
+    cursor = get_state(con, name, "pull_cursor") or ""
+    if full or not cursor:
+        cursor = EPOCH_ISO
+    filt = {"updatedAt": {"gte": cursor}}
+    if team_id:
+        filt["team"] = {"id": {"eq": team_id}}
+    if project_id:
+        filt["project"] = {"id": {"eq": project_id}}
+    rev = _reverse_status_map(cfg["status_map"])
+    pull_new = str(cfg.get("pull_new", "false")).lower() in ("1", "true", "yes", "on")
+    actor = CONNECTOR_ACTOR_PREFIX + name
+    created = updated = skipped = 0
+    newest = cursor
+    after = None
+    while True:
+        data = _linear_gql(cfg, token,
+                           "query($after: String, $filter: IssueFilter!) "
+                           "{ issues(first: 100, after: $after, filter: $filter) "
+                           "{ nodes { id identifier title description updatedAt state { name } } "
+                           "pageInfo { hasNextPage endCursor } } }",
+                           {"after": after, "filter": filt})
+        conn_issues = ((data.get("issues") or {}).get("nodes")) or []
+        for issue in conn_issues:
+            i_id = issue["id"]
+            i_updated = issue.get("updatedAt") or ""
+            if i_updated > newest:
+                newest = i_updated
+            marker = get_state(con, name, f"issue_ts:{i_id}")
+            if marker == i_updated:
+                continue  # already applied; nothing to do
+            state_name = (issue.get("state") or {}).get("name")
+            local_status = rev.get(state_name or "")
+            r = con.execute("SELECT * FROM tasks WHERE external_ref=?", (i_id,)).fetchone()
+            if r is None:
+                if not pull_new or local_status is None:
+                    skipped += 1
+                    continue
+                tid = new_id()
+                con.execute(
+                    "INSERT INTO tasks (id, title, body, status, priority, assignee, labels,"
+                    " result, created_at, updated_at, claimed_by, claimed_at,"
+                    " claim_expires_at, external_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (tid, issue.get("title") or "(titelloos)", issue.get("description") or "",
+                     local_status, 0, "", "", "", now_iso(), now_iso(), "", "", "", i_id))
+                emit(con, actor, "created", tid, source=name, issue=issue.get("identifier"),
+                     status=local_status)
+                created += 1
+            else:
+                if local_status is None:
+                    local_status = r["status"]  # unmapped Linear state: leave the board alone
+                title = issue.get("title") or ""
+                body = issue.get("description") or ""
+                if r["title"] == title and r["body"] == body and r["status"] == local_status:
+                    set_state(con, name, f"issue_ts:{i_id}", i_updated)
+                    continue  # no visible change; only advance the marker
+                con.execute("UPDATE tasks SET title=?, body=?, status=?, updated_at=? WHERE id=?",
+                            (title, body, local_status, now_iso(), r["id"]))
+                if local_status != r["status"]:
+                    emit(con, actor, local_status, r["id"], prev=r["status"], source=name,
+                         issue=issue.get("identifier"), reason="linear sync")
+                else:
+                    emit(con, actor, "synced", r["id"], source=name, issue=issue.get("identifier"),
+                         title=title)
+                updated += 1
+            set_state(con, name, f"issue_ts:{i_id}", i_updated)
+        page = (data.get("issues") or {}).get("pageInfo") or {}
+        if page.get("hasNextPage") and page.get("endCursor"):
+            after = page["endCursor"]
+        else:
+            break
+    set_state(con, name, "pull_cursor", newest)
+    return {"created": created, "updated": updated, "skipped": skipped}
+
+
+def _connector_full_reset(con, name):
+    """--full: forget cursors and per-issue markers so the next cycle
+    resyncs everything from scratch."""
+    con.execute("DELETE FROM connector_state WHERE connector=?", (name,))
+
+
+def _sync_connector(con, args, name, conn, token, full=False):
+    """One sync cycle: push board events -> Linear, then pull Linear -> board.
+    Cursors in connector_state make every cycle resumable and idempotent."""
+    cfg = dict(conn.get("config") or {})
+    cfg["status_map"] = dict(conn.get("status_map") or DEFAULT_STATUS_MAP)
+    if full:
+        _connector_full_reset(con, name)
+    team_id = _linear_team_id(cfg, token)
+    project_id = _linear_project_id(cfg, token)
+    states = _linear_states(cfg, token, team_id) if team_id else {}
+    summary = {"connector": name, "pushed": 0, "created_issues": 0, "updated_issues": 0,
+               "pulled_created": 0, "pulled_updated": 0, "pull_skipped": 0}
+
+    cursor = int(get_state(con, name, "push_cursor", "0") or 0)
+    rows = con.execute("SELECT id, actor, action, task_id FROM events WHERE id > ? ORDER BY id",
+                       (cursor,)).fetchall()
+    max_id = rows[-1]["id"] if rows else cursor
+    # push candidates: tasks whose relevant events changed since the cursor
+    candidates = {}
+    for r in rows:
+        if (r["task_id"] and not r["actor"].startswith(CONNECTOR_ACTOR_PREFIX)
+                and r["action"] in PUSH_ACTIONS):
+            candidates.setdefault(r["task_id"], r["id"])
+    for tid in sorted(candidates, key=lambda t: candidates[t]):
+        t = con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if t is None or t["status"] == "archived":
+            continue
+        try:
+            result = _linear_push_task(con, name, cfg, token, dict(t), states, team_id, project_id)
+        except ConnectorError:
+            # resumable: leave the cursor at the event that failed
+            set_state(con, name, "push_cursor", str(candidates[tid] - 1))
+            raise
+        summary["pushed"] += 1
+        summary["created_issues" if result == "created" else "updated_issues"] += 1
+    if rows:
+        set_state(con, name, "push_cursor", str(max_id))
+
+    pull = _linear_pull(con, name, cfg, token, states, team_id, project_id, full=full)
+    summary["pulled_created"] = pull["created"]
+    summary["pulled_updated"] = pull["updated"]
+    summary["pull_skipped"] = pull["skipped"]
+    summary["synced_at"] = now_iso()
+    set_state(con, name, "last_sync_at", now_iso())
+    set_state(con, name, "last_pushed", summary["pushed"])
+    set_state(con, name, "last_pulled", pull["created"] + pull["updated"])
+    set_state(con, name, "last_error", "")
+    return summary
+
+
+
 def connect(path, create=True):
     if create:
         d = os.path.dirname(path)
@@ -175,6 +531,10 @@ def connect(path, create=True):
     con.execute("PRAGMA synchronous=NORMAL")
     if create:
         con.executescript(SCHEMA)
+        # migration for boards created before connectors existed (NER-331)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
+        if "external_ref" not in cols:
+            con.execute("ALTER TABLE tasks ADD COLUMN external_ref TEXT NOT NULL DEFAULT ''")
     return con
 
 
@@ -343,6 +703,169 @@ def cmd_switch(args):
     path = os.path.abspath(reg["boards"][args.name])
     out(args, f"switched to board '{args.name}' ({path})",
         {"active": args.name, "path": path})
+
+
+def cmd_connector(args):
+    """`swrm connector add|ls|rm|auth|sync|pause|resume|status` (NER-331)."""
+    a = args.connector_cmd
+    doc = load_connectors(args)
+    conns = doc["connectors"]
+
+    if a == "ls":
+        rows = [{"name": n, "type": c.get("type"), "paused": bool(c.get("paused")),
+                 "team": (c.get("config") or {}).get("team"),
+                 "project": (c.get("config") or {}).get("project")}
+                for n, c in sorted(conns.items())]
+        if args.json:
+            out(args, "", {"connectors": rows})
+            return
+        if not rows:
+            print("(no connectors; add one with `swrm connector add linear --key team=<key>`)")
+            return
+        for r in rows:
+            state = "paused" if r["paused"] else "active"
+            print(f"{r['name']:<18} {str(r['type']):<10} {state:<8} "
+                  f"team={r['team'] or '-':<20} project={r['project'] or '-'}")
+        return
+
+    if a == "add":
+        ctype = args.type
+        name = args.name or ctype
+        if name in conns:
+            die(f"connector name taken: {name}", 1)
+        config, status_map = {}, dict(DEFAULT_STATUS_MAP)
+        for kv in args.key or []:
+            if "=" not in kv:
+                die(f"--key expects <k>=<v>, got {kv!r}", 2)
+            k, v = kv.split("=", 1)
+            if k not in ("team", "project", "pull_new", "api_base"):
+                die(f"unknown key {k!r} (valid: team, project, pull_new, api_base)", 2)
+            config[k] = v
+        for kv in args.map or []:
+            if "=" not in kv:
+                die(f"--map expects <boardstatus>=<linearstatus>, got {kv!r}", 2)
+            k, v = kv.split("=", 1)
+            if k not in ("todo", "ready", "doing", "blocked", "done"):
+                die(f"--map left side must be one of todo/ready/doing/blocked/done, got {k!r}", 2)
+            status_map[k] = v
+        conns[name] = {"type": ctype, "paused": False, "config": config,
+                       "status_map": status_map}
+        save_connectors(args, doc)
+        out(args, f"added {ctype} connector '{name}'",
+            {"name": name, "type": ctype, "config": config, "status_map": status_map})
+        return
+
+    if a == "rm":
+        if args.name not in conns:
+            die(f"unknown connector: {args.name}", 1)
+        del conns[args.name]
+        save_connectors(args, doc)
+        con = connect(resolve_db(args))
+        con.execute("DELETE FROM connector_state WHERE connector=?", (args.name,))
+        con.close()
+        out(args, f"removed connector '{args.name}' (sync state cleared)", {"removed": args.name})
+        return
+
+    if a == "auth":
+        if args.name not in conns:
+            die(f"unknown connector: {args.name}", 1)
+        token = args.token
+        if not token and args.token_file:
+            try:
+                with open(os.path.expanduser(args.token_file)) as f:
+                    token = f.read().strip()
+            except OSError as e:
+                die(f"cannot read token file: {e}", 1)
+        if not token:
+            die("provide --token <token> or --token-file <pad>", 2)
+        save_secret(args, args.name, token)
+        out(args, f"stored token for connector '{args.name}' in connectors.secrets.json (mode 600)",
+            {"connector": args.name})
+        return
+
+    if a in ("pause", "resume"):
+        if args.name not in conns:
+            die(f"unknown connector: {args.name}", 1)
+        conns[args.name]["paused"] = (a == "pause")
+        save_connectors(args, doc)
+        out(args, f"connector '{args.name}' {a}d", {"connector": args.name, "paused": a == "pause"})
+        return
+
+    if a == "sync":
+        if args.name:
+            if args.name not in conns:
+                die(f"unknown connector: {args.name}", 1)
+            names = [args.name]
+        else:
+            names = sorted(n for n, c in conns.items() if not c.get("paused"))
+            if not names:
+                die("no unpaused connectors to sync", 1)
+        con = connect(resolve_db(args))
+        results = []
+        try:
+            for n in names:
+                c = conns[n]
+                if c.get("paused") and not args.name:
+                    continue
+                if c.get("paused") and args.name:
+                    con.close()
+                    die(f"connector '{n}' is paused; resume it first (`swrm connector resume {n}`)", 1)
+                token = resolve_connector_token(args, n, c.get("type"))
+                try:
+                    s = _sync_connector(con, args, n, c, token, full=args.full)
+                except ConnectorError as e:
+                    set_state(con, n, "last_error", str(e))
+                    results.append({"connector": n, "error": str(e)})
+                    continue
+                results.append(s)
+        finally:
+            con.close()
+        errs = [r for r in results if r.get("error")]
+        if args.json:
+            out(args, "", {"synced": results})
+        else:
+            for r in results:
+                if r.get("error"):
+                    print(f"{r['connector']}: SYNC FAILED: {r['error']}")
+                else:
+                    print(f"{r['connector']}: pushed {r['pushed']} (created {r['created_issues']}, "
+                          f"updated {r['updated_issues']}), pulled {r['pulled_created']} created / "
+                          f"{r['pulled_updated']} updated / {r['pull_skipped']} skipped")
+        if errs:
+            sys.exit(1)
+        return
+
+    if a == "status":
+        con = connect(resolve_db(args))
+        names = [args.name] if args.name else sorted(conns)
+        if args.name and args.name not in conns:
+            die(f"unknown connector: {args.name}", 1)
+        data = []
+        for n in names:
+            c = conns[n]
+            data.append({
+                "name": n, "type": c.get("type"), "paused": bool(c.get("paused")),
+                "team": (c.get("config") or {}).get("team"),
+                "project": (c.get("config") or {}).get("project"),
+                "status_map": c.get("status_map") or DEFAULT_STATUS_MAP,
+                "last_sync": get_state(con, n, "last_sync_at") or "",
+                "last_pushed": get_state(con, n, "last_pushed") or "",
+                "last_pulled": get_state(con, n, "last_pulled") or "",
+                "last_error": get_state(con, n, "last_error") or "",
+                "push_cursor": get_state(con, n, "push_cursor") or "",
+                "pull_cursor": get_state(con, n, "pull_cursor") or "",
+            })
+        con.close()
+        if args.json:
+            out(args, "", {"connectors": data})
+            return
+        for d in data:
+            state = "paused" if d["paused"] else "active"
+            print(f"{d['name']:<18} {str(d['type']):<10} {state:<8} last sync: {d['last_sync'] or 'never'}")
+            if d["last_error"]:
+                print(f"    last error: {d['last_error']}")
+            print(f"    cursors: push={d['push_cursor'] or '-'} pull={d['pull_cursor'] or '-'}")
+        return
 
 
 def cmd_add(args):
@@ -1765,6 +2288,44 @@ def build_parser():
     swp = sub.add_parser("switch", parents=[common], help="make a registered board the active one")
     swp.add_argument("name", help="board name from the registry")
     swp.set_defaults(func=cmd_switch)
+
+    c = sub.add_parser("connector", help="configure and sync external connectors (Linear first)")
+    csub = c.add_subparsers(dest="connector_cmd", metavar="<action>", required=True)
+    cp = csub.add_parser("ls", parents=[common], help="list configured connectors")
+    cp.set_defaults(func=cmd_connector, connector_cmd="ls")
+    cp = csub.add_parser("add", parents=[common], help="add a connector")
+    cp.add_argument("type", choices=CONNECTOR_TYPES, help="connector type")
+    cp.add_argument("name", nargs="?", help="connector name (defaults to the type)")
+    cp.add_argument("--key", action="append", default=[], metavar="K=V",
+                   help="config key, repeatable: team, project, pull_new, api_base")
+    cp.add_argument("--map", action="append", default=[], metavar="BOARD=EXTERNAL",
+                   help="board status -> external status name, repeatable")
+    cp.set_defaults(func=cmd_connector, connector_cmd="add")
+    cp = csub.add_parser("rm", parents=[common], help="remove a connector and its sync state")
+    cp.add_argument("name", help="connector name")
+    cp.set_defaults(func=cmd_connector, connector_cmd="rm")
+    cp = csub.add_parser("auth", parents=[common],
+                        help="store an API token (in connectors.secrets.json, never in the board db)")
+    cp.add_argument("name", help="connector name")
+    cp.add_argument("--token", help="the API token (omit to read from --token-file)")
+    cp.add_argument("--token-file", help="read the token from this file")
+    cp.set_defaults(func=cmd_connector, connector_cmd="auth")
+    cp = csub.add_parser("sync", parents=[common],
+                        help="run one sync cycle: push board events, then pull external changes")
+    cp.add_argument("name", nargs="?", help="connector name (default: all unpaused connectors)")
+    cp.add_argument("--full", action="store_true",
+                   help="ignore cursors and resync everything (idempotent)")
+    cp.set_defaults(func=cmd_connector, connector_cmd="sync")
+    cp = csub.add_parser("pause", parents=[common], help="pause a connector")
+    cp.add_argument("name", help="connector name")
+    cp.set_defaults(func=cmd_connector, connector_cmd="pause")
+    cp = csub.add_parser("resume", parents=[common], help="resume a paused connector")
+    cp.add_argument("name", help="connector name")
+    cp.set_defaults(func=cmd_connector, connector_cmd="resume")
+    cp = csub.add_parser("status", parents=[common],
+                        help="show cursors, last sync and errors")
+    cp.add_argument("name", nargs="?", help="connector name (default: all)")
+    cp.set_defaults(func=cmd_connector, connector_cmd="status")
 
     a = sub.add_parser("add", parents=[common], help="create a task")
     a.add_argument("title")
