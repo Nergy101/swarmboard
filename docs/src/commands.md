@@ -5,6 +5,7 @@
 | `swrm init` | create the board database |
 | `swrm boards [ls] [add <naam> <pad>] [rename <oud> <nieuw>] [rm <naam>]` | manage the board registry (`~/.swarmboard/boards.json`); omit action (or `ls`) to list |
 | `swrm switch <naam>` | make a registered board the **active** one used by default |
+| `swrm connector ls / add / auth / sync / pause / resume / status / rm` | configure and sync external connectors (Linear first; see the Connectors page) |
 | `swrm add "title" [--body B] [--assignee A] [--priority N] [--label L]... [--parent ID]...` | create a card; starts `ready`, or `todo` if any parent isn't `done` |
 | `swrm ls [--status S] [--assignee A] [--label L]...` | list cards; `--label` repeats (AND) |
 | `swrm board [--status S] [--assignee A] [--label L]...` | static column view, optionally filtered |
