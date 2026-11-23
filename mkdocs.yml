@@ -30,5 +30,6 @@ nav:
   - Multi-agent (one PC): multi-agent.md
   - Leader-follower (multi-PC): leader-follower.md
   - Commands: commands.md
+  - Connectors: connectors.md
   - Skill: skill.md
   - Development: development.md
