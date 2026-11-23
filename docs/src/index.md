@@ -20,8 +20,9 @@ completing cards concurrently — and everyone sees it happen immediately.
   in the same transaction. `swrm watch` streams it; `swrm dash` renders it.
 - **Terminal-first** — the board *is* the terminal. Open `swrm dash` and watch
   the swarm move.
-- **Zero dependencies** — a single Python 3 file (`swrm`) using only the
-  standard library.
+- **Zero dependencies** — a single Python 3 module (`swrm.py`) using only the
+  standard library, runnable as `./swrm`, via `pipx install swarmboard`, or via
+  Homebrew.
 
 ## Where to next
 
