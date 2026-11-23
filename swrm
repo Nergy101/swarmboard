@@ -31,6 +31,18 @@ STATUSES = ["todo", "ready", "doing", "done", "blocked", "archived"]
 ACTIVE_STATUSES = ["todo", "ready", "doing", "blocked"]
 DEFAULT_CLAIM_TTL = int(os.environ.get("KANBAN_CLAIM_TTL", "900"))  # seconds
 
+# Per-label colors (see `swrm label color <name> <color>`).
+LABEL_COLORS = {
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "white": "\033[37m",
+    "default": "",
+}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     id               TEXT PRIMARY KEY,
@@ -59,6 +71,10 @@ CREATE TABLE IF NOT EXISTS events (
     action  TEXT NOT NULL,
     task_id TEXT,
     details TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS label_colors (
+    name  TEXT PRIMARY KEY,
+    color TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
@@ -158,6 +174,23 @@ def touch(con, task_id):
     con.execute("UPDATE tasks SET updated_at=? WHERE id=?", (now_iso(), task_id))
 
 
+def get_label_colors(con):
+    """Per-board label colors as {label: ansi_code_or_empty}."""
+    try:
+        rows = con.execute("SELECT name, color FROM label_colors").fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {r["name"]: LABEL_COLORS.get(r["color"], "") for r in rows}
+
+
+def colorize_label(label, colors=None, raw=False):
+    """A '#label' token, ANSI-colored when a color is set (unless NO_COLOR)."""
+    code = (colors or {}).get(label, "")
+    if code and not raw and not os.environ.get("NO_COLOR") and sys.stdout.isatty():
+        return f"{code}#{label}{RESET}"
+    return f"#{label}"
+
+
 def die(msg, code=1):
     print(f"swrm: error: {msg}", file=sys.stderr)
     sys.exit(code)
@@ -223,9 +256,9 @@ def _filter_query(args):
     if args.assignee:
         q += " AND assignee=?"
         params.append(args.assignee)
-    if args.label:
+    for lb in (getattr(args, "label", None) or []):
         q += " AND (',' || labels || ',') LIKE ?"
-        params.append(f"%,{args.label},%")
+        params.append(f"%,{lb},%")
     q += " ORDER BY priority DESC, created_at ASC"
     return q, params
 
@@ -234,6 +267,7 @@ def cmd_ls(args):
     con = connect(resolve_db(args))
     q, params = _filter_query(args)
     rows = [row_to_task(r) for r in con.execute(q, params).fetchall()]
+    colors = get_label_colors(con)
     con.close()
     if args.json:
         out(args, "", rows)
@@ -242,7 +276,7 @@ def cmd_ls(args):
         print("(no tasks)")
         return
     for t in rows:
-        labels = f" #{','.join(t['labels'])}" if t["labels"] else ""
+        labels = "".join(" " + colorize_label(lb, colors) for lb in t["labels"])
         claim = f" claimed-by:{t['claimed_by']}" if t["status"] == "doing" else ""
         assignee = f" @{t['assignee']}" if t["assignee"] else ""
         print(f"{t['id']}  [{t['status']:<7}] P{t['priority']}  {t['title']}{assignee}{claim}{labels}")
@@ -250,9 +284,14 @@ def cmd_ls(args):
 
 def cmd_board(args):
     con = connect(resolve_db(args))
-    rows = con.execute(
-        "SELECT * FROM tasks WHERE status != 'archived' ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    if args.status or args.assignee or args.label:
+        q, params = _filter_query(args)
+        rows = con.execute(q, params).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT * FROM tasks WHERE status != 'archived' ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    colors = get_label_colors(con)
     con.close()
     tasks = [row_to_task(r) for r in rows]
     if args.json:
@@ -264,7 +303,8 @@ def cmd_board(args):
         for t in col:
             assignee = f" @{t['assignee']}" if t["assignee"] else ""
             claim = f" (claimed by {t['claimed_by']})" if t["status"] == "doing" else ""
-            print(f"  {t['id']}  P{t['priority']}  {t['title']}{assignee}{claim}")
+            labels = "".join(" " + colorize_label(lb, colors) for lb in t["labels"])
+            print(f"  {t['id']}  P{t['priority']}  {t['title']}{assignee}{claim}{labels}")
         if not col:
             print("  (empty)")
 
@@ -336,7 +376,7 @@ def cmd_move(args):
     if args.status not in STATUSES:
         die(f"status must be one of: {', '.join(STATUSES)}", 2)
     t = _set_status(args, args.id, args.status)
-    out(args, f"{t['id']} -> {args.status}", t)
+    out(args, f"{t['id']} -> {t['status']}", t)
 
 
 def cmd_complete(args):
@@ -517,6 +557,114 @@ def cmd_edit(args):
     out(args, f"edited {t['id']}", t)
 
 
+def cmd_label(args):
+    """`swrm label add/rm/rm-all` per card, `swrm label ls/color` board-wide."""
+    con = connect(resolve_db(args))
+    actor = resolve_actor(args)
+
+    if args.action == "ls":
+        counts = {}
+        for r in con.execute("SELECT labels FROM tasks WHERE status != 'archived'").fetchall():
+            for lb in [x for x in r["labels"].split(",") if x]:
+                counts[lb] = counts.get(lb, 0) + 1
+        try:
+            names = {r["name"]: r["color"] for r in
+                     con.execute("SELECT name, color FROM label_colors").fetchall()}
+        except sqlite3.OperationalError:
+            names = {}
+        rows = [{"label": lb, "count": n, "color": names.get(lb, "")}
+                for lb, n in sorted(counts.items())]
+        con.close()
+        if args.json:
+            out(args, "", rows)
+            return
+        if not rows:
+            print("(no labels in use)")
+            return
+        for r in rows:
+            print(f"{r['label']:<24} {r['count']:>3} card(s)   {r['color'] or '(no color)'}")
+        return
+
+    if args.action == "color":
+        # accepts both `swrm label color <naam> <kleur>` and `... --color <kleur>`
+        name, color = args.id, args.label
+        if args.color is not None:
+            color = args.color
+        if not name:
+            die("usage: swrm label color <label> [<kleur>]  (kleur: "
+                + ", ".join(LABEL_COLORS) + "; empty clears)", 2)
+        color = color or ""
+        if color and color not in LABEL_COLORS:
+            die(f"color must be one of: {', '.join(LABEL_COLORS)} (or '' to clear)", 2)
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.execute(
+                "INSERT INTO label_colors (name, color) VALUES (?,?)"
+                " ON CONFLICT(name) DO UPDATE SET color=excluded.color",
+                (name, color),
+            )
+            emit(con, actor, "label-color", None, label=name, color=color)
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        con.close()
+        out(args, f"label '{name}' color -> {color or '(none)'}",
+            {"label": name, "color": color})
+        return
+
+    # add / rm / rm-all operate on one card
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        t = get_task(con, args.id)
+        cur = list(t["labels"])
+        if args.action == "add":
+            wanted = [lb for lb in ([args.label] + list(args.more_labels or [])) if lb]
+            if not wanted:
+                die("no labels given", 2)
+            dupes = [lb for lb in wanted if lb in cur]
+            if dupes:
+                con.execute("ROLLBACK")
+                con.close()
+                die(f"already on {t['id']}: {', '.join(dupes)}", 1)
+            labels = cur + wanted
+            emit(con, actor, "labeled", t["id"], labels=list(wanted))
+            msg = f"labeled {t['id']} with {', '.join(wanted)}"
+        elif args.action == "rm":
+            wanted = [lb for lb in ([args.label] + list(args.more_labels or [])) if lb]
+            if not wanted:
+                die("no labels given", 2)
+            missing = [lb for lb in wanted if lb not in cur]
+            if missing:
+                con.execute("ROLLBACK")
+                con.close()
+                die(f"not on {t['id']}: {', '.join(missing)}", 1)
+            labels = [lb for lb in cur if lb not in wanted]
+            emit(con, actor, "unlabeled", t["id"], labels=list(wanted))
+            msg = f"removed {', '.join(wanted)} from {t['id']}"
+        elif args.action == "rm-all":
+            labels = []
+            if cur:
+                emit(con, actor, "unlabeled", t["id"], labels=list(cur))
+            msg = f"cleared {len(cur)} label(s) from {t['id']}"
+        else:
+            con.execute("ROLLBACK")
+            con.close()
+            die(f"unknown label action: {args.action}", 2)
+        con.execute("UPDATE tasks SET labels=?, updated_at=? WHERE id=?",
+                    (",".join(labels), now_iso(), t["id"]))
+        con.execute("COMMIT")
+    except Exception:
+        try:
+            con.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    t = get_task(con, args.id)
+    con.close()
+    out(args, msg, t)
+
+
 def cmd_link(args):
     con = connect(resolve_db(args))
     actor = resolve_actor(args)
@@ -670,8 +818,18 @@ def cmd_watch(args):
     if last is None:
         r = con.execute("SELECT COALESCE(MAX(id), 0) AS m FROM events").fetchone()
         last = r["m"]
+    label_ids = None
+    labels = args.label or []
+    if labels:
+        conds, params = [], []
+        for lb in labels:
+            conds.append("(',' || labels || ',') LIKE ?")
+            params.append(f"%,{lb},%")
+        label_ids = {r["id"] for r in con.execute(
+            "SELECT id FROM tasks WHERE status != 'archived' AND " + " AND ".join(conds), params).fetchall()}
     if not args.json:
-        print(f"watching {resolve_db(args)} (feed from event #{last + 1}); Ctrl-C to stop", file=sys.stderr)
+        flt = f" (filtered: {', '.join(labels)})" if labels else ""
+        print(f"watching {resolve_db(args)} (feed from event #{last + 1}){flt}; Ctrl-C to stop", file=sys.stderr)
     try:
         while True:
             rows = con.execute(
@@ -680,6 +838,8 @@ def cmd_watch(args):
             ).fetchall()
             for r in rows:
                 last = r["id"]
+                if label_ids is not None and r["task_id"] not in label_ids:
+                    continue
                 if args.json:
                     print(json.dumps(dict(r), ensure_ascii=False), flush=True)
                 else:
@@ -724,15 +884,19 @@ def _fmt_remaining(expires_iso):
 CARD_H = 4  # each board cell is a bordered card: top border, title, meta, bottom border
 
 
-def _task_card(t, col_w):
+def _task_card(t, col_w, label_colors=None):
     """Content lines of a card (without the border): human-readable title first,
-    then a dim meta line with id/priority/worker."""
+    then a dim meta line with id/priority/worker/labels."""
     inner = col_w - 2
     meta = f"{t['id']} P{t['priority']}"
     if t["status"] == "doing" and t["claimed_by"]:
         meta += f" [{t['claimed_by']} {_fmt_remaining(t['claim_expires_at'])}]"
     elif t["assignee"]:
         meta += f" @{t['assignee']}"
+    # Plain (uncolored) in the curses dash: ANSI codes would corrupt the
+    # addnstr() width math there. The plain frame below colorizes labels.
+    for lb in t["labels"]:
+        meta += " " + (colorize_label(lb, label_colors) if label_colors is not None else f"#{lb}")
     return [_truncate(t["title"], inner), _truncate(meta, inner)]
 
 
@@ -755,7 +919,7 @@ def _column_tasks(tasks, cols):
     return col_tasks
 
 
-def render_frame(tasks, events, title, feed_lines):
+def render_frame(tasks, events, title, feed_lines, label_colors=None):
     width, height = shutil.get_terminal_size((100, 30))
     width = max(60, width)
     no_color = bool(os.environ.get("NO_COLOR"))
@@ -787,7 +951,7 @@ def render_frame(tasks, events, title, feed_lines):
             for s in cols:
                 ts = col_tasks[s]
                 if i < len(ts):
-                    card = _task_card(ts[i], col_w)
+                    card = _task_card(ts[i], col_w, label_colors)
                     if li == 0:
                         cells.append(C[s] + "┌" + "─" * (col_w - 2) + "┐" + R)
                     elif li == CARD_H - 1:
@@ -1080,17 +1244,23 @@ def _curses_dash(snap, title, args, detail=None):
 def cmd_dash(args):
     path = resolve_db(args)
     con = connect(path)
+    labels = args.label or []
 
     def snap():
         tasks = [row_to_task(r) for r in con.execute(
             "SELECT * FROM tasks WHERE status != 'archived' ORDER BY priority DESC, created_at ASC"
         ).fetchall()]
+        for lb in labels:
+            tasks = [t for t in tasks if lb in t["labels"]]
         events = [dict(r) for r in con.execute(
             "SELECT id, ts, actor, action, task_id, details FROM events ORDER BY id DESC LIMIT ?",
             (args.feed,),
         ).fetchall()]
         events.reverse()
         return tasks, events
+
+    def colors():
+        return get_label_colors(con)
 
     def detail(tid):
         r = con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
@@ -1107,7 +1277,7 @@ def cmd_dash(args):
     follow = args.follow or (is_tty and not args.once)
     if not follow:
         tasks, events = snap()
-        print(render_frame(tasks, events, path, args.feed))
+        print(render_frame(tasks, events, path, args.feed, colors()))
         con.close()
         return
     if is_tty:
@@ -1125,7 +1295,7 @@ def cmd_dash(args):
     try:
         while True:
             tasks, events = snap()
-            frame = render_frame(tasks, events, path, args.feed)
+            frame = render_frame(tasks, events, path, args.feed, colors())
             if is_tty:
                 out.write("\033[H\033[2J" + frame + "\n")
             else:
@@ -1219,9 +1389,10 @@ def _snapshot(db_path, feed_lines):
         "SELECT id, ts, actor, action, task_id, details FROM events ORDER BY id DESC LIMIT ?",
         (feed_lines,),
     ).fetchall()]
+    label_colors = get_label_colors(con)
     con.close()
     events.reverse()
-    return {"tasks": tasks, "events": events, "db": db_path, "now": now_iso()}
+    return {"tasks": tasks, "events": events, "labels": label_colors, "db": db_path, "now": now_iso()}
 
 
 class KanbanHandler(BaseHTTPRequestHandler):
@@ -1373,7 +1544,11 @@ def remote_dash(args, url):
 
     def snap():
         s = _remote_get(url, f"/snapshot?feed={args.feed}", _passkey(args))
+        snap.labels = s.get("labels") or {}
         return s["tasks"], s["events"]
+
+    def colors():
+        return getattr(snap, "labels", {})
 
     def detail(tid):
         headers = {"Content-Type": "application/json"}
@@ -1394,7 +1569,7 @@ def remote_dash(args, url):
 
     if not follow:
         tasks, events = snap()
-        print(render_frame(tasks, events, url, args.feed))
+        print(render_frame(tasks, events, url, args.feed, colors()))
         return
     if is_tty:
         try:
@@ -1410,7 +1585,7 @@ def remote_dash(args, url):
     try:
         while True:
             tasks, events = snap()
-            frame = render_frame(tasks, events, url, args.feed)
+            frame = render_frame(tasks, events, url, args.feed, colors())
             if is_tty:
                 out.write("\033[H\033[2J" + frame + "\n")
             else:
@@ -1456,10 +1631,14 @@ def build_parser():
     l = sub.add_parser("ls", parents=[common], help="list tasks")
     l.add_argument("--status", choices=STATUSES)
     l.add_argument("--assignee")
-    l.add_argument("--label")
+    l.add_argument("--label", action="append", help="label filter; repeatable (AND)")
     l.set_defaults(func=cmd_ls)
 
-    sub.add_parser("board", parents=[common], help="column view of the board").set_defaults(func=cmd_board)
+    b = sub.add_parser("board", parents=[common], help="column view of the board")
+    b.add_argument("--status", choices=STATUSES)
+    b.add_argument("--assignee")
+    b.add_argument("--label", action="append", help="label filter; repeatable (AND)")
+    b.set_defaults(func=cmd_board)
 
     s = sub.add_parser("show", parents=[common], help="task detail + history")
     s.add_argument("id")
@@ -1514,6 +1693,15 @@ def build_parser():
     e.add_argument("--label", action="append")
     e.set_defaults(func=cmd_edit)
 
+    lb = sub.add_parser("label", parents=[common],
+                        help="manage labels on a card (add/rm/rm-all) or board-wide (ls/color)")
+    lb.add_argument("action", choices=["add", "rm", "rm-all", "ls", "color"])
+    lb.add_argument("id", nargs="?", help="task id (add/rm/rm-all), or label name (color)")
+    lb.add_argument("label", nargs="?", help="label name (add/rm), or color name (color)")
+    lb.add_argument("more_labels", nargs="*", help="additional labels (add/rm)")
+    lb.add_argument("--color", help=f"color name (color action): {', '.join(LABEL_COLORS)}")
+    lb.set_defaults(func=cmd_label)
+
     ln = sub.add_parser("link", parents=[common], help="link parent -> child (child waits for parent)")
     ln.add_argument("parent")
     ln.add_argument("child")
@@ -1546,6 +1734,7 @@ def build_parser():
     w = sub.add_parser("watch", parents=[common], help="stream the change feed live (Ctrl-C to stop)")
     w.add_argument("--since", type=int, help="event id to start after (default: latest)")
     w.add_argument("--interval", type=float, default=0.2, help="poll interval seconds (default 0.2)")
+    w.add_argument("--label", action="append", help="only events for tasks with this label; repeatable (AND)")
     w.set_defaults(func=cmd_watch)
 
     d = sub.add_parser("dash", aliases=["dashboard", "live"], parents=[common],
@@ -1554,6 +1743,7 @@ def build_parser():
     d.add_argument("--once", action="store_true", help="render one snapshot and exit (default when piped)")
     d.add_argument("--follow", action="store_true", help="keep streaming frames even when not a TTY")
     d.add_argument("--feed", type=int, default=8, help="feed lines to show at the bottom (default 8)")
+    d.add_argument("--label", action="append", help="only cards with this label; repeatable (AND)")
     d.set_defaults(func=cmd_dash)
 
     sv = sub.add_parser("serve", parents=[common],
