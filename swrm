@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.error
@@ -1049,16 +1050,36 @@ def _draw_modal(stdscr, t, det, attrs, off):
     return off, (win_x, win_y, mw, mh)
 
 
+def _copy_to_clipboard(text):
+    """Best-effort copy of text to the system clipboard. Returns True on success."""
+    if sys.platform == "darwin":
+        candidates = [["pbcopy"]]
+    elif os.name == "nt":
+        candidates = [["clip"]]
+    else:
+        candidates = [["wl-copy"], ["xclip", "-selection", "clipboard"],
+                      ["xsel", "--clipboard", "--input"]]
+    for cmd in candidates:
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode(), check=True, timeout=5)
+                return True
+            except Exception:
+                continue
+    return False
+
+
 def _curses_dash(snap, title, args, detail=None):
     """Full-screen dashboard TUI: column headers and feed stay pinned. Move the
     cursor with arrows or hjkl, open a card's detail modal with Enter or a mouse
-    click, q or Ctrl-C quits. Falls back to the plain frame loop if curses is
-    unavailable."""
+    click, Ctrl-C copies the selected card's task id to the clipboard, q quits.
+    Falls back to the plain frame loop if curses is unavailable."""
     os.environ.setdefault("ESCDELAY", "25")  # snappy arrow-key parsing
     import curses
 
     def main(stdscr):
         curses.curs_set(0)
+        curses.raw()  # disable ISIG so Ctrl-C reaches getch() as 3 instead of SIGINT
         curses.mousemask(curses.ALL_MOUSE_EVENTS)
         stdscr.timeout(max(100, int(args.interval * 1000)))
         if not os.environ.get("NO_COLOR") and curses.has_colors():
@@ -1079,8 +1100,12 @@ def _curses_dash(snap, title, args, detail=None):
         modal = None   # {"t": task, "det": detail-dict} while a card popup is open
         moff = 0       # popup scroll offset
         mrect = None   # popup rect (x, y, w, h)
+        flash_msg = None    # transient footer confirmation (e.g. "copied t_...")
+        flash_until = 0.0   # time.time() until which flash_msg stays visible
         while True:
             tasks, events = snap()
+            if flash_msg and time.time() >= flash_until:
+                flash_msg = None
             h, w = stdscr.getmaxyx()
             w = max(60, w)
             feed_n = min(args.feed, max(0, h - 12))
@@ -1171,7 +1196,12 @@ def _curses_dash(snap, title, args, detail=None):
                                 stdscr.addch(y, x + col_w - 1, curses.ACS_VLINE, attr)
                         x += col_w + 1
             stdscr.addnstr(bot, 0, "-" * (w - 1), w - 1)
-            stdscr.addnstr(bot + 1, 0, " FEED (latest events)   [enter/click: card details · click another card: switch · arrows/hjkl: move · q: quit]", w - 1)
+            if flash_msg:
+                footer = f" {flash_msg}   [arrows/hjkl: move · enter/click: details · ctrl-c: copy id · q: quit]"
+                stdscr.addnstr(bot + 1, 0, _truncate(footer, w - 1), w - 1, curses.A_BOLD)
+            else:
+                footer = " FEED (latest events)   [enter/click: card details · click another card: switch · arrows/hjkl: move · ctrl-c: copy id · q: quit]"
+                stdscr.addnstr(bot + 1, 0, _truncate(footer, w - 1), w - 1)
             for i, e in enumerate(events[:feed_n]):
                 ts = e["ts"][11:19] if len(e["ts"]) >= 19 else e["ts"]
                 line = f"#{e['id']} {ts} {e['actor']} {e['action']} {e['task_id'] or '-'} {e['details']}"
@@ -1186,6 +1216,11 @@ def _curses_dash(snap, title, args, detail=None):
                 # outside it closes it — or switches to the clicked card
                 if ch in (ord("q"), 27, 10, 13, curses.KEY_ENTER):
                     close_modal()
+                elif ch == 3:  # Ctrl-C: copy the open card's id
+                    tid = modal["t"]["id"]
+                    flash_msg = (f"copied {tid} to clipboard" if _copy_to_clipboard(tid)
+                                 else "no clipboard tool found (pbcopy/xclip/xsel/wl-copy)")
+                    flash_until = time.time() + 3
                 elif ch in (curses.KEY_UP, ord("k")):
                     moff = max(0, moff - 1)
                 elif ch in (curses.KEY_DOWN, ord("j")):
@@ -1210,9 +1245,16 @@ def _curses_dash(snap, title, args, detail=None):
                 elif ch == curses.KEY_RESIZE:
                     pass
                 continue
-            if ch in (ord("q"), 3):  # q or Ctrl-C
+            if ch == ord("q"):  # q quits
                 break
-            if ch in (curses.KEY_UP, ord("k")):
+            if ch == 3:  # Ctrl-C: copy the selected card's task id
+                ts = col_tasks[cols[sel_col]]
+                if sel_row < len(ts):
+                    tid = ts[sel_row]["id"]
+                    flash_msg = (f"copied {tid} to clipboard" if _copy_to_clipboard(tid)
+                                 else "no clipboard tool found (pbcopy/xclip/xsel/wl-copy)")
+                    flash_until = time.time() + 3
+            elif ch in (curses.KEY_UP, ord("k")):
                 sel_row = max(0, sel_row - 1)
             elif ch in (curses.KEY_DOWN, ord("j")):
                 sel_row += 1
