@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarmboard"
+description = "CLI-first kanban board for agent swarms: one board, a live change feed, and multiple agents at once."
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["kanban", "agents", "cli", "swarm", "todo"]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Nergy101/swarmboard"
+Documentation = "https://nergy101.github.io/swarmboard/"
+
+[project.scripts]
+swrm = "swrm:main"
+
+[tool.setuptools]
+py-modules = ["swrm"]
+
+[tool.setuptools.dynamic]
+version = { attr = "swrm.__version__" }
