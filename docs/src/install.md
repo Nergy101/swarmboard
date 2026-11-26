@@ -5,6 +5,9 @@
 ```bash
 pipx install swarmboard    # command: swrm
 swrm init                  # create ./.kanban/kanban.db
+
+The first `swrm init` prints a one-time welcome guide with the everyday
+commands; `swrm help` shows it again any time.
 ```
 
 ## Homebrew (needs the tap once)
@@ -22,6 +25,9 @@ cd swarmboard
 chmod +x swrm                   # already executable
 ln -s "$PWD/swrm" ~/.local/bin/swrm   # optional: put it on PATH
 swrm init                       # create ./.kanban/kanban.db
+
+The first `swrm init` prints a one-time welcome guide with the everyday
+commands; `swrm help` shows it again any time.
 ```
 
 `./swrm` is a two-line shim that runs the CLI next to it (`swrm.py`); a

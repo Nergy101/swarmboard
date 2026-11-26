@@ -20,6 +20,8 @@ Planned first tagged release: `v0.1.0`.
 - `NER-329` distribution: `pipx install swarmboard`, a Homebrew formula
   (`packaging/homebrew/swrm.rb`) and `swrm update` self-update against the
   PyPI JSON API.
+- Onboarding: a one-time welcome guide on `swrm init` and the first
+  interactive `swrm dash`, and `swrm help` to show it any time.
 
 ### Release steps
 

@@ -190,6 +190,72 @@ def save_registry(reg):
         json.dump(reg, f, indent=2)
 
 
+
+# ---------------------------------------------------------------- onboarding
+
+DOCS_URL = "https://nergy101.github.io/swarmboard/"
+
+
+def _brand_line():
+    return f"swarmboard {VERSION} - One board. The whole swarm."
+
+
+def _box(lines):
+    width = max([len(l) for l in lines] + [72])
+    edge = "+" + "-" * (width + 2) + "+"
+    body = "\n".join("| " + l.ljust(width) + " |" for l in lines)
+    return edge + "\n" + body + "\n" + edge
+
+
+QUICKSTEPS = [
+    ("swrm init", "create the board database"),
+    ('swrm add "first task"', "add a card"),
+    ("swrm claim --any", "atomically claim the best ready card"),
+    ('swrm complete <id> --summary "..."', "mark done (children auto-promote)"),
+    ("swrm dash", "live board in the terminal (q to quit)"),
+    ("swrm help", "show this guide any time"),
+]
+GUIDE = _box([_brand_line(), ""]
+             + ["Quick start:"]
+             + [f"  {cmd:<37} {d}" for cmd, d in QUICKSTEPS]
+             + ["", "Docs: " + DOCS_URL,
+                "Full command reference: swrm --help (or the Commands page in the docs)"])
+
+
+def onboarded_path():
+    """Marker file: the welcome guide shows once per user (per $SWRM_HOME)."""
+    return os.path.join(swrm_home(), "onboarded")
+
+
+def is_onboarded():
+    return os.path.exists(onboarded_path())
+
+
+def mark_onboarded():
+    try:
+        os.makedirs(swrm_home(), exist_ok=True)
+        with open(onboarded_path(), "w") as f:
+            f.write(now_iso() + "\n")
+    except OSError:
+        pass  # onboarding is cosmetic; never fail a command over it
+
+
+def print_guide():
+    print(GUIDE)
+
+
+def maybe_show_welcome(args, interactive_only=False):
+    """Show the welcome guide once per user. Never in --json mode; with
+    interactive_only, also require a TTY (so piped/`--once` dash output stays
+    machine-friendly) and leave the marker untouched for later."""
+    if getattr(args, "json", False) or is_onboarded():
+        return
+    if interactive_only and not sys.stdout.isatty():
+        return
+    print("")
+    print_guide()
+    mark_onboarded()
+
 # ------------------------------------------------------------- connectors (NER-331)
 
 
@@ -637,6 +703,14 @@ def cmd_init(args):
     con = connect(path)
     con.close()
     out(args, f"initialized board at {path}", {"db": path})
+    maybe_show_welcome(args)
+
+
+def cmd_help(args):
+    """`swrm help`: the quick-start guide (always shown, marker untouched)."""
+    print("")
+    print_guide()
+
 
 
 def cmd_boards(args):
@@ -1985,6 +2059,7 @@ def _curses_dash(snap, title, args, detail=None):
 def cmd_dash(args):
     path = resolve_db(args)
     title = board_label(args)
+    maybe_show_welcome(args, interactive_only=True)
     con = connect(path)
     labels = args.label or []
 
@@ -2363,6 +2438,8 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init", parents=[common], help="create the board database").set_defaults(func=cmd_init)
+    sub.add_parser("help", parents=[common],
+                   help="quick-start guide and where to go next").set_defaults(func=cmd_help)
 
     bo = sub.add_parser("boards", parents=[common],
                         help="list registered boards, or add/rename/rm entries")
@@ -2560,7 +2637,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     url = getattr(args, "url", None) or os.environ.get("KANBAN_URL")
-    if url and args.cmd not in ("serve", "update"):
+    if url and args.cmd not in ("serve", "update", "help"):
         if args.cmd == "watch":
             remote_watch(args, url)
             return
