@@ -1,31 +1,53 @@
 name: release
 
+# Publishes the version in `swrm.py` to PyPI and then cuts its git tag.
+# Runs on every push to main; exits cleanly when that version is already
+# tagged. NOTE: a tag pushed from inside Actions does not retrigger
+# workflows (GITHUB_TOKEN), so publishing has to live in the same run.
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   id-token: write  # PyPI trusted publishing (no API tokens needed)
+  contents: write  # cut the release tag
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: pypi
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          fetch-depth: 0
 
-      - name: Run the test suite before packaging
+      - name: Skip if this version is already released
+        run: |
+          v="v$(grep -oP '__version__ = "\K[0-9]+\.[0-9]+\.[0-9]+' swrm.py | head -1)"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          if git rev-parse "$v" >/dev/null 2>&1; then
+            echo "$v already tagged; nothing to release"
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          fi
+
+      - if: env.SKIP != 'true'
+        name: Run the test suite before packaging
         run: python3 -m unittest discover -s tests -v
 
-      - name: Build sdist and wheel
+      - if: env.SKIP != 'true'
+        name: Build sdist and wheel
         run: |
           python3 -m pip install --upgrade build
           python3 -m build
 
-      - name: Publish to PyPI (trusted publishing)
+      - if: env.SKIP != 'true'
+        name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - if: env.SKIP != 'true'
+        name: Tag the release
+        run: |
+          git config user.name "release-bot"
+          git config user.email "actions@github.com"
+          git tag -a "$VERSION" -m "swarmboard $VERSION"
+          git push origin "$VERSION"
