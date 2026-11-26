@@ -2,8 +2,20 @@
 
 ## The CLI
 
-Single file: `swrm` (Python 3 stdlib only). Schema: `tasks`, `links`
-(parent→child), `events` (append-only audit feed).
+Two files: `swrm` (a two-line shim for `./swrm` usage) and `swrm.py` (the real
+CLI - Python 3 stdlib only). Schema: `tasks`, `links` (parent→child), `events`
+(append-only audit feed), `label_colors`, `connector_state`. The version lives
+in `__version__` in `swrm.py` (`swrm --version`).
+
+## Releasing
+
+1. Bump `__version__` in `swrm.py` and add a `CHANGELOG.md` section.
+2. Tag `vX.Y.Z`; the `release` workflow runs the tests, builds sdist + wheel
+   and publishes to PyPI via **trusted publishing** (no tokens; configure the
+   `pypi` GitHub environment once).
+3. Update `packaging/homebrew/swrm.rb` in the tap repo: new version + the
+   sdist's `sha256` from the PyPI release page (the placeholder checksum
+   refuses to install until you do).
 
 ## Brand assets
 

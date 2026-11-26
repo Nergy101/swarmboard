@@ -33,19 +33,26 @@ concurrently — and everyone sees it happen immediately.
   in the same transaction. `swrm watch` streams it; `swrm dash` renders it.
 - **Terminal-first** — the board *is* the terminal. Open `swrm dash` and watch
   the swarm move.
-- **Zero dependencies** — a single Python 3 file (`swrm`) using only the standard library.
+- **Zero dependencies** — a single Python 3 module (`swrm.py`) using only the standard library.
 
 ## Install
 
 ```bash
+pipx install swarmboard    # command: swrm
+```
+
+or with Homebrew: `brew tap Nergy101/swrm && brew install swrm`, or from source:
+
+```bash
 git clone https://github.com/Nergy101/swarmboard.git
 cd swarmboard
-chmod +x swrm                   # already executable
+chmod +x swrm                   # already executable (two-line shim around swrm.py)
 ln -s "$PWD/swrm" ~/.local/bin/swrm   # optional: put it on PATH
 swrm init                       # create ./.kanban/kanban.db
 ```
 
-Requires Python 3.8+. Board location: `--db PATH`, else `$KANBAN_DB`, else
+Requires Python 3.9+. `swrm update` self-updates pipx/Homebrew/git installs.
+Board location: `--db PATH`, else `$KANBAN_DB`, else
 `./.kanban/kanban.db`. Actor name: `--actor NAME`, else `$KANBAN_ACTOR`, else
 `$USER`. Every command also accepts `--json`. Remote mode: set `$KANBAN_URL`
 (or pass `--url`) and every command runs against the leader over HTTP — see
@@ -82,9 +89,7 @@ their claim. In the live full-screen view the column headers and feed stay
 pinned; move the cursor with ↑/↓/←/→ (or hjkl) and press **Enter or click a
 card** to open a detail modal (history, parents/children, body) — click another
 card to switch the modal to it, click outside to close; `q` closes the
-modal / quits; **Ctrl-C or `c` copies the selected card's task id to the
-clipboard** (terminals don't forward Cmd-C to apps, so `c` is the
-mac-friendly hotkey). `swrm dash --once` prints one snapshot (default when piped);
+modal / quits. `swrm dash --once` prints one snapshot (default when piped);
 `swrm watch --json` is the NDJSON feed for piping into other agents.
 
 ## Lifecycle
@@ -182,7 +187,6 @@ swrm dash       <──GET /snapshot / /events?since=N (long-poll)──
 | `swrm events [--task ID] [--limit N]` | dump the change feed |
 | `swrm watch [--json] [--since N] [--interval S]` | stream the change feed live (Ctrl-C to stop) |
 | `swrm serve [--host H] [--port P] [--passkey K]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL`; `--passkey` requires followers to authenticate |
-| `swrm update [--check]` | update swrm itself to the latest upstream version (git fast-forward if installed from a clone, else download from GitHub; `--check` only reports) |
 | all commands | `--url http://leader:8765` / `$KANBAN_URL` to run remotely; `--passkey` / `$KANBAN_PASSKEY` to authenticate |
 
 ## The swarmboard skill
