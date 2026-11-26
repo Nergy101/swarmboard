@@ -3,6 +3,7 @@
 | Command | What it does |
 |---|---|
 | `swrm init` | create the board database |
+| `swrm help` | the quick-start guide (also shows once on `swrm init` and the first interactive `swrm dash`) |
 | `swrm boards [ls] [add <naam> <pad>] [rename <oud> <nieuw>] [rm <naam>]` | manage the board registry (`~/.swarmboard/boards.json`); omit action (or `ls`) to list |
 | `swrm switch <naam>` | make a registered board the **active** one used by default |
 | `swrm connector ls / add / auth / sync / pause / resume / status / rm` | configure and sync external connectors (Linear first; see the Connectors page) |

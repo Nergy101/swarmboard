@@ -167,6 +167,7 @@ swrm dash       <──GET /snapshot / /events?since=N (long-poll)──
 | Command | What it does |
 |---|---|
 | `swrm init` | create the board database |
+| `swrm help` | quick-start guide and where to go next |
 | `swrm add "title" [--body B] [--assignee A] [--priority N] [--label L]... [--parent ID]...` | create a card; starts `ready`, or `todo` if any parent isn't `done` |
 | `swrm ls [--status S] [--assignee A] [--label L]` | list cards |
 | `swrm board` | static column view |
