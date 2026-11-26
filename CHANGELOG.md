@@ -6,9 +6,15 @@ reads it dynamically and `swrm --version` prints it.
 
 ## [Unreleased]
 
-Planned first tagged release: `v0.1.0`.
+Nothing yet.
 
-### Added since the first PyPI-compatible packaging
+## [0.1.0] - 2026-11-26
+
+First tagged release: multi-agent kanban CLI, live dash, leader-follower
+ mode, labels, multi-board, two-way Linear sync, pipx/Homebrew distribution
+ and first-run onboarding.
+
+### Added
 
 - `NER-328` card labels: per-board label colors, repeatable `--label` filters
   on `ls` / `board` / `watch` / `dash`, and `swrm label` management commands.

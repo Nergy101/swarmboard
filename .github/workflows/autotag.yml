@@ -1,0 +1,31 @@
+name: autotag
+
+# Cuts the git tag for the version in swrm.py when main is pushed/merged.
+# The tag then triggers release.yml (tests -> build -> PyPI trusted publishing).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag the current version if the tag is missing
+        run: |
+          v="v$(python3 -c 'import re; print(re.search(r"__version__ = .([^"]+).", open("swrm.py").read()).group(1))')"
+          if git rev-parse "$v" >/dev/null 2>&1; then
+            echo "$v already exists; nothing to do"
+            exit 0
+          fi
+          git config user.name "release-bot"
+          git config user.email "actions@github.com"
+          git tag -a "$v" -m "swarmboard $v"
+          git push origin "$v"
