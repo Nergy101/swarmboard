@@ -28,6 +28,7 @@
 | `swrm events [--task ID] [--limit N]` | dump the change feed |
 | `swrm watch [--json] [--since N] [--interval S] [--label L]...` | stream the change feed live (Ctrl-C to stop); `--label` filters to cards carrying the label(s) |
 | `swrm serve [--host H] [--port P] [--passkey K]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL`; `--passkey` requires followers to authenticate |
+| `swrm update [--check]` | update swrm itself to the latest upstream version (git fast-forward if installed from a clone, else download from GitHub; `--check` only reports) |
 
 ## Global flags
 

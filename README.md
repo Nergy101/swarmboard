@@ -82,8 +82,9 @@ their claim. In the live full-screen view the column headers and feed stay
 pinned; move the cursor with ↑/↓/←/→ (or hjkl) and press **Enter or click a
 card** to open a detail modal (history, parents/children, body) — click another
 card to switch the modal to it, click outside to close; `q` closes the
-modal / quits; **Ctrl-C copies the selected card's task id to the
-clipboard**. `swrm dash --once` prints one snapshot (default when piped);
+modal / quits; **Ctrl-C or `c` copies the selected card's task id to the
+clipboard** (terminals don't forward Cmd-C to apps, so `c` is the
+mac-friendly hotkey). `swrm dash --once` prints one snapshot (default when piped);
 `swrm watch --json` is the NDJSON feed for piping into other agents.
 
 ## Lifecycle
@@ -181,6 +182,7 @@ swrm dash       <──GET /snapshot / /events?since=N (long-poll)──
 | `swrm events [--task ID] [--limit N]` | dump the change feed |
 | `swrm watch [--json] [--since N] [--interval S]` | stream the change feed live (Ctrl-C to stop) |
 | `swrm serve [--host H] [--port P] [--passkey K]` | run the **leader server** (default 127.0.0.1:8765) so other PCs can connect via `KANBAN_URL`; `--passkey` requires followers to authenticate |
+| `swrm update [--check]` | update swrm itself to the latest upstream version (git fast-forward if installed from a clone, else download from GitHub; `--check` only reports) |
 | all commands | `--url http://leader:8765` / `$KANBAN_URL` to run remotely; `--passkey` / `$KANBAN_PASSKEY` to authenticate |
 
 ## The swarmboard skill
